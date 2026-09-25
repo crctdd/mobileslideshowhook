@@ -4,4 +4,4 @@
 - Package：`com.crctdd.mobileslideshowhook`
 - 支持：iOS 15-17
 - 注入：`com.apple.mobileslideshow`
-- 无设置面板
+- 无设置面板，安装注销立即生效
