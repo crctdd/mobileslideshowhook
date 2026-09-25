@@ -75,6 +75,108 @@ static UIWindow *MSHBestWindow(void) {
     return windows.firstObject;
 }
 
+static BOOL MSHViewAndAncestorsAreVisible(UIView *view) {
+    if (!view || !view.window || view.hidden || view.alpha < 0.08) {
+        return NO;
+    }
+
+    UIView *cursor = view.superview;
+
+    while (cursor) {
+        if (cursor.hidden || cursor.alpha < 0.08) {
+            return NO;
+        }
+
+        cursor = cursor.superview;
+    }
+
+    CGRect rectInWindow = [view convertRect:view.bounds toView:view.window];
+
+    if (CGRectIsEmpty(rectInWindow) ||
+        CGRectIsNull(rectInWindow) ||
+        !CGRectIntersectsRect(rectInWindow, view.window.bounds)) {
+        return NO;
+    }
+
+    CGRect intersection = CGRectIntersection(rectInWindow, view.window.bounds);
+
+    return CGRectGetWidth(intersection) > 20.0 &&
+           CGRectGetHeight(intersection) > 20.0;
+}
+
+static BOOL MSHClassNameLooksLikePhotosChrome(UIView *view) {
+    NSString *className = NSStringFromClass(view.class);
+
+    if (className.length == 0) {
+        return NO;
+    }
+
+    NSArray<NSString *> *tokens = @[
+        @"NavigationBar",
+        @"Toolbar",
+        @"Chrome",
+        @"Scrubber",
+        @"Accessory",
+        @"PlaybackControl",
+        @"ControlBar"
+    ];
+
+    for (NSString *token in tokens) {
+        if ([className rangeOfString:token
+                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL MSHPhotosChromeVisibleInView(UIView *view) {
+    if (!view || view.hidden || view.alpha < 0.08) {
+        return NO;
+    }
+
+    BOOL candidate = NO;
+
+    if ([view isKindOfClass:[UINavigationBar class]] ||
+        [view isKindOfClass:[UIToolbar class]]) {
+        candidate = YES;
+    } else if (MSHClassNameLooksLikePhotosChrome(view)) {
+        CGRect bounds = view.bounds;
+
+        /*
+         * Ignore tiny helper views whose class name happens to contain
+         * a chrome-related token.
+         */
+        if (CGRectGetWidth(bounds) > 80.0 &&
+            CGRectGetHeight(bounds) > 20.0) {
+            candidate = YES;
+        }
+    }
+
+    if (candidate && MSHViewAndAncestorsAreVisible(view)) {
+        return YES;
+    }
+
+    for (UIView *subview in view.subviews) {
+        if (MSHPhotosChromeVisibleInView(subview)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL MSHPhotosChromeIsVisible(void) {
+    for (UIWindow *window in MSHForegroundWindows()) {
+        if (MSHPhotosChromeVisibleInView(window)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
 static BOOL MSHViewIsActuallyVisible(UIView *view) {
     if (!view || !view.window || view.hidden || view.alpha < 0.02) {
         return NO;
@@ -226,7 +328,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     return bestLayer;
 }
 
-@interface MSHProgressManager : NSObject <UIGestureRecognizerDelegate>
+@interface MSHProgressManager : NSObject
 
 @property (nonatomic, strong) AVPlayer *player;
 @property (nonatomic, strong) AVPlayerItem *lastPlayerItem;
@@ -240,12 +342,8 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 @property (nonatomic, strong) UILabel *currentLabel;
 @property (nonatomic, strong) UILabel *durationLabel;
 @property (nonatomic, strong) NSLayoutConstraint *bottomConstraint;
-@property (nonatomic, strong) UITapGestureRecognizer *screenTapGesture;
-
 @property (nonatomic, assign) BOOL userTracking;
-@property (nonatomic, assign) BOOL userHidden;
 @property (nonatomic, assign) BOOL videoWasVisible;
-@property (nonatomic, assign) CFTimeInterval lastTapToggleTime;
 
 @end
 
@@ -500,15 +598,10 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 
     if (self.barContainer.superview != window) {
         [self.barContainer removeFromSuperview];
-
-        if (self.screenTapGesture && self.hostWindow) {
-            [self.hostWindow removeGestureRecognizer:self.screenTapGesture];
-        }
-
         [window addSubview:self.barContainer];
 
         /*
-         * Move the custom bar higher than Photos' stock scrubber.
+         * Keep the custom bar above Photos' stock scrubber.
          * Portrait: 118 pt above safe-area bottom
          * Landscape: 72 pt above safe-area bottom
          */
@@ -527,19 +620,6 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 
         self.bottomConstraint = bottom;
         self.hostWindow = window;
-
-        UITapGestureRecognizer *screenTap =
-            [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                    action:@selector(screenTapped:)];
-
-        screenTap.delegate = self;
-        screenTap.numberOfTapsRequired = 1;
-        screenTap.cancelsTouchesInView = NO;
-        screenTap.delaysTouchesBegan = NO;
-        screenTap.delaysTouchesEnded = NO;
-
-        [window addGestureRecognizer:screenTap];
-        self.screenTapGesture = screenTap;
     }
 
     BOOL landscape =
@@ -614,20 +694,17 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 
     if (visiblePlayer != self.player) {
         [self bindPlayer:visiblePlayer];
-        self.userHidden = NO;
     }
 
     AVPlayerItem *currentItem = visiblePlayer.currentItem;
 
     if (currentItem != self.lastPlayerItem) {
         self.lastPlayerItem = currentItem;
-        self.userHidden = NO;
         self.userTracking = NO;
     }
 
     if (!self.videoWasVisible) {
         self.videoWasVisible = YES;
-        self.userHidden = NO;
     }
 
     UIWindow *window = MSHBestWindow();
@@ -639,7 +716,14 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 
     [self ensureBarInWindow:window];
     [self updateProgress];
-    [self setBarVisible:!self.userHidden];
+
+    /*
+     * Do not maintain a separate tap state anymore.
+     * The tweak follows Photos' own chrome: when the user taps and Photos
+     * hides its native controls/scrubber, our bar hides too; when Photos'
+     * controls return, our bar returns with them.
+     */
+    [self setBarVisible:MSHPhotosChromeIsVisible()];
 }
 
 - (void)updateProgress {
@@ -751,56 +835,6 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     [self seekToSliderValue];
 }
 
-- (void)screenTapped:(UITapGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateEnded ||
-        !self.videoWasVisible ||
-        !self.visiblePlayerLayer) {
-        return;
-    }
-
-    /*
-     * Photos itself may have several simultaneous single-tap recognizers.
-     * Debouncing prevents one physical tap from toggling our state twice.
-     */
-    CFTimeInterval now = CACurrentMediaTime();
-
-    if ((now - self.lastTapToggleTime) < 0.32) {
-        return;
-    }
-
-    self.lastTapToggleTime = now;
-    self.userHidden = !self.userHidden;
-    [self setBarVisible:!self.userHidden];
-}
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
-       shouldReceiveTouch:(UITouch *)touch {
-    UIView *touchedView = touch.view;
-
-    if (!self.videoWasVisible || !self.visiblePlayerLayer) {
-        return NO;
-    }
-
-    if (!touchedView) {
-        return YES;
-    }
-
-    if (self.barContainer &&
-        [touchedView isDescendantOfView:self.barContainer]) {
-        return NO;
-    }
-
-    if ([touchedView isKindOfClass:[UIControl class]]) {
-        return NO;
-    }
-
-    return YES;
-}
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
-shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    return YES;
-}
 
 @end
 
