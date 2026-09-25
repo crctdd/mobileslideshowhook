@@ -1,0 +1,9 @@
+Package: com.crctdd.mobileslideshowhook
+Name: 系统相册视频进度条
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: 为系统相册视频播放界面增加视频进度条 (支持iOS 15-17)
+Maintainer: crctdd
+Author: crctdd
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 15.0), firmware (<< 18.0)
