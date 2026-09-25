@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = MobileSlideShowHook
 MobileSlideShowHook_FILES = Tweak.xm
 MobileSlideShowHook_CFLAGS = -fobjc-arc
-MobileSlideShowHook_FRAMEWORKS = UIKit AVFoundation QuartzCore
+MobileSlideShowHook_FRAMEWORKS = UIKit AVFoundation AVKit QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk

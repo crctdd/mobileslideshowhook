@@ -58,10 +58,6 @@ jobs:
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
           cp -v packages/*.deb artifacts/roothide/
 
-      - name: Show packages
-        run: |
-          find artifacts -type f -name "*.deb" -print
-
       - name: Upload rootless
         if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'rootless' }}
         uses: actions/upload-artifact@v4

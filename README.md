@@ -1,43 +1,32 @@
 # 系统相册视频进度条
 
-- Package: `com.crctdd.mobileslideshowhook`
-- Version: `0.0.1`
-- Target: iOS 15-17
-- Process: `MobileSlideShow`
-- No preference bundle
-- Installs a draggable video progress slider into the system Photos video player
+- 插件名：系统相册视频进度条
+- Package：`com.crctdd.mobileslideshowhook`
+- Version：`0.0.1`
+- 支持：iOS 15-17
+- 注入：`com.apple.mobileslideshow`
+- 无设置面板
 
-## Build
+## 这一版的播放器识别方式
 
-Default scheme is rootless:
+不再只扫描 UIView/CALayer 树寻找播放器。
 
-```sh
-make clean package
-```
+现在同时 Hook：
 
-Explicit rootless:
+- `AVPlayerLayer`
+- `AVPlayerViewController`
+- `AVPlayer`
 
-```sh
-make clean package THEOS_PACKAGE_SCHEME=rootless
-```
-
-Roothide, when using a Theos environment that supports the roothide scheme:
-
-```sh
-make clean package THEOS_PACKAGE_SCHEME=roothide
-```
-
-After installation, fully close Photos from the app switcher and reopen it so the tweak is loaded.
-
+当系统相册把视频播放器交给 AVFoundation/AVKit 时直接捕获播放器，再把自定义进度条与该播放器绑定。
 
 ## GitHub Actions
 
-This project includes `.github/workflows/build.yml`.
+Actions → Build MobileSlideShowHook → Run workflow
 
-Open the repository's **Actions** page, choose **Build MobileSlideShowHook**, click **Run workflow**, then select:
+可选：
 
-- `all` — build rootless + roothide
-- `rootless` — build rootless only
-- `roothide` — build roothide only
+- `all`
+- `rootless`
+- `roothide`
 
-The workflow runs only when manually triggered and uploads the generated `.deb` files as GitHub Actions artifacts.
+安装后完全退出系统相册，再重新打开测试。

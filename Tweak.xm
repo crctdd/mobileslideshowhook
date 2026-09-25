@@ -1,6 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <math.h>
 
 @interface MSHProgressSlider : UISlider
@@ -9,38 +11,13 @@
 @implementation MSHProgressSlider
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    CGRect expanded = CGRectInset(self.bounds, -18.0, -14.0);
-    return CGRectContainsPoint(expanded, point);
+    CGRect expandedBounds = CGRectInset(self.bounds, -20.0, -14.0);
+    return CGRectContainsPoint(expandedBounds, point);
 }
 
 @end
 
-@interface MSHPlayerCandidate : NSObject
-@property (nonatomic, weak) UIView *ownerView;
-@property (nonatomic, strong) AVPlayer *player;
-@property (nonatomic, assign) CGFloat score;
-@end
-
-@implementation MSHPlayerCandidate
-@end
-
-static BOOL MSHViewIsVisible(UIView *view) {
-    if (!view || !view.window || view.hidden || view.alpha < 0.02) {
-        return NO;
-    }
-
-    UIView *cursor = view.superview;
-    while (cursor) {
-        if (cursor.hidden || cursor.alpha < 0.02) {
-            return NO;
-        }
-        cursor = cursor.superview;
-    }
-
-    return YES;
-}
-
-static BOOL MSHPlayerHasUsableDuration(AVPlayer *player) {
+static BOOL MSHDurationIsValid(AVPlayer *player) {
     AVPlayerItem *item = player.currentItem;
     if (!item) {
         return NO;
@@ -55,117 +32,81 @@ static BOOL MSHPlayerHasUsableDuration(AVPlayer *player) {
     return isfinite(duration) && duration > 0.25;
 }
 
-static void MSHInspectLayerTree(CALayer *layer, UIView *ownerView, MSHPlayerCandidate *candidate) {
-    if (!layer || layer.hidden || layer.opacity < 0.02) {
-        return;
+static BOOL MSHLayerTreeIsVisible(CALayer *layer) {
+    if (!layer || !layer.superlayer || layer.hidden || layer.opacity < 0.02) {
+        return NO;
     }
 
-    if ([layer isKindOfClass:[AVPlayerLayer class]]) {
-        AVPlayerLayer *playerLayer = (AVPlayerLayer *)layer;
-        AVPlayer *player = playerLayer.player;
-
-        if (player && player.currentItem) {
-            CGFloat width = CGRectGetWidth(layer.bounds);
-            CGFloat height = CGRectGetHeight(layer.bounds);
-            CGFloat area = fabs(width * height);
-
-            if (area <= 1.0) {
-                area = fabs(CGRectGetWidth(ownerView.bounds) * CGRectGetHeight(ownerView.bounds));
-            }
-
-            BOOL usable = MSHPlayerHasUsableDuration(player);
-            CGFloat score = area + (usable ? 10000000.0 : 0.0);
-
-            if (score > candidate.score) {
-                candidate.score = score;
-                candidate.ownerView = ownerView;
-                candidate.player = player;
-            }
+    CALayer *cursor = layer.superlayer;
+    while (cursor) {
+        if (cursor.hidden || cursor.opacity < 0.02) {
+            return NO;
         }
+        cursor = cursor.superlayer;
     }
 
-    for (CALayer *sublayer in layer.sublayers) {
-        MSHInspectLayerTree(sublayer, ownerView, candidate);
-    }
+    return YES;
 }
 
-static void MSHInspectViewTree(UIView *view, MSHPlayerCandidate *candidate) {
-    if (!view || !MSHViewIsVisible(view)) {
-        return;
-    }
-
-    MSHInspectLayerTree(view.layer, view, candidate);
-
-    for (UIView *subview in view.subviews) {
-        MSHInspectViewTree(subview, candidate);
-    }
-}
-
-static NSArray<UIWindow *> *MSHSceneWindows(UIApplication *application) {
-    NSMutableArray<UIWindow *> *foregroundWindows = [NSMutableArray array];
-    NSMutableArray<UIWindow *> *otherWindows = [NSMutableArray array];
+static NSArray<UIWindow *> *MSHForegroundWindows(void) {
+    UIApplication *application = UIApplication.sharedApplication;
+    NSMutableArray<UIWindow *> *result = [NSMutableArray array];
 
     for (UIScene *scene in application.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) {
             continue;
         }
 
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        BOOL foreground =
-            (scene.activationState == UISceneActivationStateForegroundActive ||
-             scene.activationState == UISceneActivationStateForegroundInactive);
+        if (scene.activationState != UISceneActivationStateForegroundActive &&
+            scene.activationState != UISceneActivationStateForegroundInactive) {
+            continue;
+        }
 
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
         for (UIWindow *window in windowScene.windows) {
-            if (foreground) {
-                [foregroundWindows addObject:window];
-            } else {
-                [otherWindows addObject:window];
+            if (!window.hidden && window.alpha > 0.02) {
+                [result addObject:window];
             }
         }
     }
 
-    if (foregroundWindows.count > 0) {
-        return foregroundWindows;
-    }
-
-    return otherWindows;
+    return result;
 }
 
-static UIWindow *MSHCurrentWindow(void) {
-    UIApplication *application = UIApplication.sharedApplication;
-    NSArray<UIWindow *> *windows = MSHSceneWindows(application);
+static UIWindow *MSHBestWindow(void) {
+    NSArray<UIWindow *> *windows = MSHForegroundWindows();
 
     for (UIWindow *window in windows) {
-        if (window.isKeyWindow && !window.hidden && window.alpha > 0.02) {
+        if (window.isKeyWindow) {
             return window;
         }
     }
 
     for (UIWindow *window in windows) {
-        if (!window.hidden &&
-            window.alpha > 0.02 &&
-            window.windowLevel == UIWindowLevelNormal) {
+        if (window.windowLevel == UIWindowLevelNormal) {
             return window;
         }
     }
 
-    for (UIWindow *window in windows) {
-        if (!window.hidden && window.alpha > 0.02) {
-            return window;
-        }
-    }
-
-    return nil;
+    return windows.firstObject;
 }
 
 @interface MSHProgressManager : NSObject
-@property (nonatomic, weak) UIWindow *window;
-@property (nonatomic, strong) MSHProgressSlider *slider;
-@property (nonatomic, strong) NSLayoutConstraint *bottomConstraint;
 @property (nonatomic, strong) AVPlayer *player;
-@property (nonatomic, strong) id timeObserver;
-@property (nonatomic, strong) NSTimer *scanTimer;
+@property (nonatomic, weak) AVPlayerLayer *playerLayer;
+@property (nonatomic, weak) AVPlayerViewController *playerController;
+@property (nonatomic, strong) id periodicTimeObserver;
+@property (nonatomic, strong) NSTimer *refreshTimer;
+
+@property (nonatomic, weak) UIWindow *hostWindow;
+@property (nonatomic, strong) UIView *barContainer;
+@property (nonatomic, strong) MSHProgressSlider *slider;
+@property (nonatomic, strong) UILabel *currentLabel;
+@property (nonatomic, strong) UILabel *durationLabel;
+@property (nonatomic, strong) NSLayoutConstraint *bottomConstraint;
+
 @property (nonatomic, assign) BOOL userTracking;
+@property (nonatomic, assign) CFTimeInterval lastPlayerActivity;
 @end
 
 @implementation MSHProgressManager
@@ -182,6 +123,8 @@ static UIWindow *MSHCurrentWindow(void) {
 - (instancetype)init {
     self = [super init];
     if (self) {
+        _lastPlayerActivity = 0.0;
+
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(applicationDidBecomeActive:)
                                                      name:UIApplicationDidBecomeActiveNotification
@@ -192,9 +135,14 @@ static UIWindow *MSHCurrentWindow(void) {
                                                      name:UIApplicationWillResignActiveNotification
                                                    object:nil];
 
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(playerItemEnded:)
+                                                     name:AVPlayerItemDidPlayToEndTimeNotification
+                                                   object:nil];
+
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self startScanning];
-            [self scanNow];
+            [self startRefreshTimer];
+            [self refreshNow];
         });
     }
     return self;
@@ -202,58 +150,206 @@ static UIWindow *MSHCurrentWindow(void) {
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self stopScanning];
+    [self stopRefreshTimer];
     [self bindPlayer:nil];
 }
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
-    [self startScanning];
-    [self scanNow];
+    [self startRefreshTimer];
+    [self refreshNow];
 }
 
 - (void)applicationWillResignActive:(NSNotification *)notification {
-    [self stopScanning];
-    self.slider.hidden = YES;
+    [self stopRefreshTimer];
+    [self setBarVisible:NO];
 }
 
-- (void)startScanning {
-    if (self.scanTimer) {
+- (void)playerItemEnded:(NSNotification *)notification {
+    if (notification.object == self.player.currentItem) {
+        [self refreshNow];
+    }
+}
+
+- (void)startRefreshTimer {
+    if (self.refreshTimer) {
         return;
     }
 
-    self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.65
-                                                      target:self
-                                                    selector:@selector(scanTimerFired:)
-                                                    userInfo:nil
-                                                     repeats:YES];
+    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.25
+                                                        target:self
+                                                      selector:@selector(refreshTimerFired:)
+                                                      userInfo:nil
+                                                       repeats:YES];
 }
 
-- (void)stopScanning {
-    [self.scanTimer invalidate];
-    self.scanTimer = nil;
+- (void)stopRefreshTimer {
+    [self.refreshTimer invalidate];
+    self.refreshTimer = nil;
 }
 
-- (void)scanTimerFired:(NSTimer *)timer {
-    [self scanNow];
+- (void)refreshTimerFired:(NSTimer *)timer {
+    [self refreshNow];
 }
 
-- (void)attachSliderToWindow:(UIWindow *)window {
+- (void)notePlayer:(AVPlayer *)player
+             layer:(AVPlayerLayer *)layer
+        controller:(AVPlayerViewController *)controller {
+    if (![NSThread isMainThread]) {
+        __weak AVPlayer *weakPlayer = player;
+        __weak AVPlayerLayer *weakLayer = layer;
+        __weak AVPlayerViewController *weakController = controller;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self notePlayer:weakPlayer layer:weakLayer controller:weakController];
+        });
+        return;
+    }
+
+    self.lastPlayerActivity = CACurrentMediaTime();
+
+    if (layer) {
+        self.playerLayer = layer;
+    }
+
+    if (controller) {
+        self.playerController = controller;
+    }
+
+    if (player && player != self.player) {
+        [self bindPlayer:player];
+    }
+
+    [self refreshNow];
+}
+
+- (void)playerWasUsed:(AVPlayer *)player {
+    if (!player) {
+        return;
+    }
+
+    if (![NSThread isMainThread]) {
+        __weak AVPlayer *weakPlayer = player;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self playerWasUsed:weakPlayer];
+        });
+        return;
+    }
+
+    if (player == self.player) {
+        self.lastPlayerActivity = CACurrentMediaTime();
+        [self refreshNow];
+    }
+}
+
+- (void)layerDetached:(AVPlayerLayer *)layer {
+    if (![NSThread isMainThread]) {
+        __weak AVPlayerLayer *weakLayer = layer;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self layerDetached:weakLayer];
+        });
+        return;
+    }
+
+    if (layer && layer == self.playerLayer) {
+        self.playerLayer = nil;
+
+        if (!self.playerController) {
+            [self setBarVisible:NO];
+        }
+    }
+}
+
+- (void)controllerDisappeared:(AVPlayerViewController *)controller {
+    if (![NSThread isMainThread]) {
+        __weak AVPlayerViewController *weakController = controller;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self controllerDisappeared:weakController];
+        });
+        return;
+    }
+
+    if (controller && controller == self.playerController) {
+        self.playerController = nil;
+
+        if (!self.playerLayer || !MSHLayerTreeIsVisible(self.playerLayer)) {
+            [self setBarVisible:NO];
+        }
+    }
+}
+
+- (void)bindPlayer:(AVPlayer *)player {
+    if (self.player == player) {
+        return;
+    }
+
+    if (self.periodicTimeObserver && self.player) {
+        @try {
+            [self.player removeTimeObserver:self.periodicTimeObserver];
+        } @catch (__unused NSException *exception) {
+        }
+    }
+
+    self.periodicTimeObserver = nil;
+    self.player = player;
+    self.userTracking = NO;
+
+    if (!player) {
+        [self setBarVisible:NO];
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+
+    self.periodicTimeObserver =
+        [player addPeriodicTimeObserverForInterval:CMTimeMake(1, 10)
+                                             queue:dispatch_get_main_queue()
+                                        usingBlock:^(__unused CMTime time) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+
+        [strongSelf updateProgress];
+    }];
+}
+
+- (void)ensureBarInWindow:(UIWindow *)window {
     if (!window) {
         return;
     }
 
-    if (!self.slider) {
+    if (!self.barContainer) {
+        UIView *container = [UIView new];
+        container.translatesAutoresizingMaskIntoConstraints = NO;
+        container.hidden = YES;
+        container.userInteractionEnabled = YES;
+        container.layer.cornerRadius = 12.0;
+        container.layer.masksToBounds = YES;
+        container.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.46];
+
+        UILabel *currentLabel = [UILabel new];
+        currentLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        currentLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.0 weight:UIFontWeightMedium];
+        currentLabel.textColor = UIColor.whiteColor;
+        currentLabel.textAlignment = NSTextAlignmentLeft;
+        currentLabel.text = @"0:00";
+
+        UILabel *durationLabel = [UILabel new];
+        durationLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        durationLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.0 weight:UIFontWeightMedium];
+        durationLabel.textColor = UIColor.whiteColor;
+        durationLabel.textAlignment = NSTextAlignmentRight;
+        durationLabel.text = @"0:00";
+
         MSHProgressSlider *slider = [MSHProgressSlider new];
         slider.translatesAutoresizingMaskIntoConstraints = NO;
         slider.minimumValue = 0.0f;
         slider.maximumValue = 1.0f;
         slider.continuous = YES;
-        slider.hidden = YES;
+        slider.minimumTrackTintColor = UIColor.whiteColor;
+        slider.maximumTrackTintColor = [UIColor.whiteColor colorWithAlphaComponent:0.32];
+        slider.thumbTintColor = UIColor.whiteColor;
         slider.accessibilityLabel = @"视频进度";
-
-        slider.minimumTrackTintColor = UIColor.labelColor;
-        slider.maximumTrackTintColor = [UIColor.labelColor colorWithAlphaComponent:0.28];
-        slider.thumbTintColor = UIColor.labelColor;
 
         [slider addTarget:self
                    action:@selector(sliderTouchDown:)
@@ -269,172 +365,194 @@ static UIWindow *MSHCurrentWindow(void) {
                            UIControlEventTouchUpOutside |
                            UIControlEventTouchCancel)];
 
-        self.slider = slider;
-    }
+        UITapGestureRecognizer *tap =
+            [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(sliderTapped:)];
+        tap.cancelsTouchesInView = NO;
+        [slider addGestureRecognizer:tap];
 
-    if (self.slider.superview != window) {
-        [self.slider removeFromSuperview];
-        [window addSubview:self.slider];
-
-        NSLayoutConstraint *bottomConstraint =
-            [self.slider.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor
-                                                    constant:-86.0];
+        [container addSubview:currentLabel];
+        [container addSubview:durationLabel];
+        [container addSubview:slider];
 
         [NSLayoutConstraint activateConstraints:@[
-            [self.slider.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor constant:54.0],
-            [self.slider.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-54.0],
-            [self.slider.heightAnchor constraintEqualToConstant:34.0],
-            bottomConstraint
+            [currentLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:12.0],
+            [currentLabel.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
+            [currentLabel.widthAnchor constraintEqualToConstant:42.0],
+
+            [durationLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-12.0],
+            [durationLabel.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
+            [durationLabel.widthAnchor constraintEqualToConstant:42.0],
+
+            [slider.leadingAnchor constraintEqualToAnchor:currentLabel.trailingAnchor constant:6.0],
+            [slider.trailingAnchor constraintEqualToAnchor:durationLabel.leadingAnchor constant:-6.0],
+            [slider.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
+            [slider.heightAnchor constraintEqualToConstant:32.0]
         ]];
 
-        self.bottomConstraint = bottomConstraint;
-        self.window = window;
+        self.barContainer = container;
+        self.slider = slider;
+        self.currentLabel = currentLabel;
+        self.durationLabel = durationLabel;
+    }
+
+    if (self.barContainer.superview != window) {
+        [self.barContainer removeFromSuperview];
+        [window addSubview:self.barContainer];
+
+        NSLayoutConstraint *bottom =
+            [self.barContainer.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor
+                                                           constant:-64.0];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [self.barContainer.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor constant:14.0],
+            [self.barContainer.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-14.0],
+            [self.barContainer.heightAnchor constraintEqualToConstant:44.0],
+            bottom
+        ]];
+
+        self.bottomConstraint = bottom;
+        self.hostWindow = window;
     }
 
     BOOL landscape = CGRectGetWidth(window.bounds) > CGRectGetHeight(window.bounds);
-    self.bottomConstraint.constant = landscape ? -34.0 : -86.0;
+    self.bottomConstraint.constant = landscape ? -18.0 : -64.0;
 
-    [window bringSubviewToFront:self.slider];
+    [window bringSubviewToFront:self.barContainer];
 }
 
-- (void)scanNow {
+- (NSString *)timeString:(double)seconds {
+    if (!isfinite(seconds) || seconds < 0.0) {
+        seconds = 0.0;
+    }
+
+    NSInteger wholeSeconds = (NSInteger)llround(floor(seconds));
+    NSInteger hours = wholeSeconds / 3600;
+    NSInteger minutes = (wholeSeconds % 3600) / 60;
+    NSInteger secs = wholeSeconds % 60;
+
+    if (hours > 0) {
+        return [NSString stringWithFormat:@"%ld:%02ld:%02ld",
+                (long)hours,
+                (long)minutes,
+                (long)secs];
+    }
+
+    return [NSString stringWithFormat:@"%ld:%02ld",
+            (long)minutes,
+            (long)secs];
+}
+
+- (BOOL)hasVisiblePlaybackHost {
+    if (self.playerController) {
+        UIView *view = self.playerController.viewIfLoaded;
+        if (view.window && !view.hidden && view.alpha > 0.02) {
+            return YES;
+        }
+    }
+
+    if (self.playerLayer && MSHLayerTreeIsVisible(self.playerLayer)) {
+        return YES;
+    }
+
+    if (self.player && self.player.rate != 0.0f) {
+        return YES;
+    }
+
+    if (self.player) {
+        CFTimeInterval age = CACurrentMediaTime() - self.lastPlayerActivity;
+        if (age >= 0.0 && age <= 5.0) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+- (void)setBarVisible:(BOOL)visible {
+    if (!self.barContainer) {
+        return;
+    }
+
+    self.barContainer.hidden = !visible;
+
+    if (visible && self.hostWindow) {
+        [self.hostWindow bringSubviewToFront:self.barContainer];
+    }
+}
+
+- (void)refreshNow {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
-        self.slider.hidden = YES;
+        [self setBarVisible:NO];
         return;
     }
 
-    UIWindow *window = MSHCurrentWindow();
+    AVPlayer *player = self.player;
+    if (!player || !MSHDurationIsValid(player) || ![self hasVisiblePlaybackHost]) {
+        [self setBarVisible:NO];
+        return;
+    }
+
+    UIWindow *window = MSHBestWindow();
     if (!window) {
-        self.slider.hidden = YES;
-        [self bindPlayer:nil];
+        [self setBarVisible:NO];
         return;
     }
 
-    [self attachSliderToWindow:window];
-
-    MSHPlayerCandidate *candidate = [MSHPlayerCandidate new];
-    candidate.score = -1.0;
-    MSHInspectViewTree(window, candidate);
-
-    AVPlayer *candidatePlayer = candidate.player;
-
-    if (!candidatePlayer || !candidate.ownerView || !MSHViewIsVisible(candidate.ownerView)) {
-        self.slider.hidden = YES;
-        [self bindPlayer:nil];
-        return;
-    }
-
-    if (candidatePlayer != self.player) {
-        [self bindPlayer:candidatePlayer];
-    }
-
-    [self refreshSliderFromPlayer];
+    [self ensureBarInWindow:window];
+    [self updateProgress];
+    [self setBarVisible:YES];
 }
 
-- (void)bindPlayer:(AVPlayer *)player {
-    if (self.player == player) {
-        return;
-    }
-
-    if (self.timeObserver && self.player) {
-        @try {
-            [self.player removeTimeObserver:self.timeObserver];
-        } @catch (__unused NSException *exception) {
-        }
-    }
-
-    self.timeObserver = nil;
-    self.player = player;
-    self.userTracking = NO;
-
-    if (!player) {
-        self.slider.hidden = YES;
-        return;
-    }
-
-    __weak typeof(self) weakSelf = self;
-    CMTime interval = CMTimeMake(1, 4);
-
-    self.timeObserver =
-        [player addPeriodicTimeObserverForInterval:interval
-                                             queue:dispatch_get_main_queue()
-                                        usingBlock:^(CMTime time) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) {
-            return;
-        }
-
-        [strongSelf refreshSliderFromPlayer];
-    }];
-
-    [self refreshSliderFromPlayer];
-}
-
-- (void)refreshSliderFromPlayer {
+- (void)updateProgress {
     AVPlayer *player = self.player;
     AVPlayerItem *item = player.currentItem;
 
-    if (!player || !item) {
-        self.slider.hidden = YES;
+    if (!player || !item || !MSHDurationIsValid(player)) {
+        [self setBarVisible:NO];
         return;
     }
 
-    CMTime durationTime = item.duration;
-    if (!CMTIME_IS_NUMERIC(durationTime)) {
-        self.slider.hidden = YES;
-        return;
-    }
+    double duration = CMTimeGetSeconds(item.duration);
+    double current = CMTimeGetSeconds(player.currentTime);
 
-    double duration = CMTimeGetSeconds(durationTime);
     if (!isfinite(duration) || duration <= 0.25) {
-        self.slider.hidden = YES;
+        [self setBarVisible:NO];
         return;
     }
 
-    self.slider.maximumValue = (float)duration;
+    if (!isfinite(current)) {
+        current = 0.0;
+    }
+
+    current = MIN(MAX(current, 0.0), duration);
+
     self.slider.minimumValue = 0.0f;
+    self.slider.maximumValue = (float)duration;
 
     if (!self.userTracking) {
-        double current = CMTimeGetSeconds(player.currentTime);
-
-        if (isfinite(current)) {
-            current = MIN(MAX(current, 0.0), duration);
-            [self.slider setValue:(float)current animated:NO];
-        }
+        [self.slider setValue:(float)current animated:NO];
+        self.currentLabel.text = [self timeString:current];
     }
 
-    self.slider.hidden = NO;
-
-    if (self.window) {
-        [self.window bringSubviewToFront:self.slider];
-    }
+    self.durationLabel.text = [self timeString:duration];
 }
 
-- (void)sliderTouchDown:(UISlider *)slider {
-    self.userTracking = YES;
-}
-
-- (void)sliderValueChanged:(UISlider *)slider {
-    self.userTracking = YES;
-}
-
-- (void)sliderTouchEnded:(UISlider *)slider {
+- (void)seekToSliderValue {
     AVPlayer *player = self.player;
-
     if (!player) {
         self.userTracking = NO;
         return;
     }
 
-    double seconds = slider.value;
-
+    double seconds = self.slider.value;
     if (!isfinite(seconds) || seconds < 0.0) {
         self.userTracking = NO;
         return;
     }
 
     CMTime target = CMTimeMakeWithSeconds(seconds, 600);
-    CMTime tolerance = CMTimeMakeWithSeconds(0.05, 600);
+    CMTime tolerance = CMTimeMakeWithSeconds(0.03, 600);
 
     __weak typeof(self) weakSelf = self;
 
@@ -449,35 +567,119 @@ static UIWindow *MSHCurrentWindow(void) {
             }
 
             strongSelf.userTracking = NO;
-            [strongSelf refreshSliderFromPlayer];
+            strongSelf.lastPlayerActivity = CACurrentMediaTime();
+            [strongSelf updateProgress];
         });
     }];
 }
 
+- (void)sliderTouchDown:(UISlider *)slider {
+    self.userTracking = YES;
+    self.lastPlayerActivity = CACurrentMediaTime();
+}
+
+- (void)sliderValueChanged:(UISlider *)slider {
+    self.userTracking = YES;
+    self.lastPlayerActivity = CACurrentMediaTime();
+    self.currentLabel.text = [self timeString:slider.value];
+}
+
+- (void)sliderTouchEnded:(UISlider *)slider {
+    [self seekToSliderValue];
+}
+
+- (void)sliderTapped:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded || !self.slider) {
+        return;
+    }
+
+    CGPoint location = [gesture locationInView:self.slider];
+    CGFloat width = CGRectGetWidth(self.slider.bounds);
+
+    if (width <= 1.0) {
+        return;
+    }
+
+    CGFloat ratio = MIN(MAX(location.x / width, 0.0), 1.0);
+    float value =
+        self.slider.minimumValue +
+        (self.slider.maximumValue - self.slider.minimumValue) * ratio;
+
+    self.userTracking = YES;
+    self.slider.value = value;
+    self.currentLabel.text = [self timeString:value];
+    [self seekToSliderValue];
+}
+
 @end
 
-%hook UIViewController
+%hook AVPlayerLayer
+
+- (void)setPlayer:(AVPlayer *)player {
+    %orig(player);
+
+    if (player) {
+        [[MSHProgressManager sharedManager] notePlayer:player
+                                                layer:self
+                                           controller:nil];
+    } else {
+        [[MSHProgressManager sharedManager] layerDetached:self];
+    }
+}
+
+- (void)removeFromSuperlayer {
+    [[MSHProgressManager sharedManager] layerDetached:self];
+    %orig;
+}
+
+%end
+
+%hook AVPlayerViewController
+
+- (void)setPlayer:(AVPlayer *)player {
+    %orig(player);
+
+    if (player) {
+        [[MSHProgressManager sharedManager] notePlayer:player
+                                                layer:nil
+                                           controller:self];
+    }
+}
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[MSHProgressManager sharedManager] scanNow];
-    });
+    if (self.player) {
+        [[MSHProgressManager sharedManager] notePlayer:self.player
+                                                layer:nil
+                                           controller:self];
+    }
 }
 
-- (void)viewDidLayoutSubviews {
+- (void)viewDidDisappear:(BOOL)animated {
     %orig;
+    [[MSHProgressManager sharedManager] controllerDisappeared:self];
+}
 
-    static CFTimeInterval lastScan = 0.0;
-    CFTimeInterval now = CACurrentMediaTime();
+%end
 
-    if (now - lastScan > 0.20) {
-        lastScan = now;
+%hook AVPlayer
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[MSHProgressManager sharedManager] scanNow];
-        });
+- (void)play {
+    %orig;
+    [[MSHProgressManager sharedManager] playerWasUsed:self];
+}
+
+- (void)pause {
+    %orig;
+    [[MSHProgressManager sharedManager] playerWasUsed:self];
+}
+
+- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
+    %orig(item);
+
+    if (item) {
+        [[MSHProgressManager sharedManager] playerWasUsed:self];
     }
 }
 
