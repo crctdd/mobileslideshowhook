@@ -16,7 +16,7 @@
 
 @end
 
-static BOOL MSHPlayerItemIsUsableVideo(AVPlayer *player) {
+static BOOL MSHPlayerItemHasUsableDuration(AVPlayer *player) {
     AVPlayerItem *item = player.currentItem;
     if (!item) {
         return NO;
@@ -28,16 +28,7 @@ static BOOL MSHPlayerItemIsUsableVideo(AVPlayer *player) {
     }
 
     double duration = CMTimeGetSeconds(durationTime);
-    if (!isfinite(duration) || duration <= 0.25) {
-        return NO;
-    }
-
-    CGSize presentationSize = item.presentationSize;
-    if (presentationSize.width <= 1.0 || presentationSize.height <= 1.0) {
-        return NO;
-    }
-
-    return YES;
+    return isfinite(duration) && duration > 0.25;
 }
 
 static NSArray<UIWindow *> *MSHForegroundWindows(void) {
@@ -90,10 +81,12 @@ static BOOL MSHViewIsActuallyVisible(UIView *view) {
     }
 
     UIView *cursor = view.superview;
+
     while (cursor) {
         if (cursor.hidden || cursor.alpha < 0.02) {
             return NO;
         }
+
         cursor = cursor.superview;
     }
 
@@ -107,26 +100,28 @@ static BOOL MSHViewIsActuallyVisible(UIView *view) {
     }
 
     CGRect intersection = CGRectIntersection(rectInWindow, window.bounds);
-    return CGRectGetWidth(intersection) > 2.0 && CGRectGetHeight(intersection) > 2.0;
+
+    return CGRectGetWidth(intersection) > 2.0 &&
+           CGRectGetHeight(intersection) > 2.0;
 }
 
-static BOOL MSHPlayerLayerIsActuallyVisible(AVPlayerLayer *playerLayer, UIWindow *window) {
+static BOOL MSHLayerIsActuallyVisible(AVPlayerLayer *playerLayer,
+                                      UIWindow *window,
+                                      CGFloat *visibleAreaOut) {
     if (!playerLayer ||
+        !window ||
         !playerLayer.player ||
+        !MSHPlayerItemHasUsableDuration(playerLayer.player) ||
         playerLayer.hidden ||
         playerLayer.opacity < 0.02 ||
         !playerLayer.superlayer) {
         return NO;
     }
 
-    if (CGRectGetWidth(playerLayer.bounds) <= 2.0 ||
-        CGRectGetHeight(playerLayer.bounds) <= 2.0) {
-        return NO;
-    }
+    CGFloat width = CGRectGetWidth(playerLayer.bounds);
+    CGFloat height = CGRectGetHeight(playerLayer.bounds);
 
-    CGRect videoRect = playerLayer.videoRect;
-    if (CGRectGetWidth(videoRect) <= 1.0 ||
-        CGRectGetHeight(videoRect) <= 1.0) {
+    if (width <= 40.0 || height <= 40.0) {
         return NO;
     }
 
@@ -136,74 +131,99 @@ static BOOL MSHPlayerLayerIsActuallyVisible(AVPlayerLayer *playerLayer, UIWindow
         if (cursor.hidden || cursor.opacity < 0.02) {
             return NO;
         }
+
         cursor = cursor.superlayer;
     }
 
     id delegate = playerLayer.delegate;
-    if ([delegate isKindOfClass:[UIView class]]) {
-        return MSHViewIsActuallyVisible((UIView *)delegate);
-    }
 
-    if (!window) {
+    if ([delegate isKindOfClass:[UIView class]] &&
+        !MSHViewIsActuallyVisible((UIView *)delegate)) {
         return NO;
     }
 
+    CGRect rectInWindowLayer;
+
     @try {
-        CGRect rectInWindowLayer = [playerLayer convertRect:playerLayer.bounds toLayer:window.layer];
-
-        if (CGRectIsEmpty(rectInWindowLayer) ||
-            CGRectIsNull(rectInWindowLayer) ||
-            !CGRectIntersectsRect(rectInWindowLayer, window.layer.bounds)) {
-            return NO;
-        }
-
-        CGRect intersection = CGRectIntersection(rectInWindowLayer, window.layer.bounds);
-        return CGRectGetWidth(intersection) > 2.0 &&
-               CGRectGetHeight(intersection) > 2.0;
+        rectInWindowLayer = [playerLayer convertRect:playerLayer.bounds
+                                             toLayer:window.layer];
     } @catch (__unused NSException *exception) {
         return NO;
     }
+
+    if (CGRectIsEmpty(rectInWindowLayer) ||
+        CGRectIsNull(rectInWindowLayer) ||
+        !CGRectIntersectsRect(rectInWindowLayer, window.layer.bounds)) {
+        return NO;
+    }
+
+    CGRect intersection =
+        CGRectIntersection(rectInWindowLayer, window.layer.bounds);
+
+    CGFloat visibleWidth = CGRectGetWidth(intersection);
+    CGFloat visibleHeight = CGRectGetHeight(intersection);
+    CGFloat visibleArea = visibleWidth * visibleHeight;
+    CGFloat windowArea =
+        CGRectGetWidth(window.bounds) * CGRectGetHeight(window.bounds);
+
+    /*
+     * Photos may keep neighbouring video players alive while paging.
+     * Requiring a meaningful on-screen area prevents an off-screen or
+     * tiny preloaded player from making the progress bar appear on photos.
+     */
+    if (visibleWidth < 100.0 ||
+        visibleHeight < 100.0 ||
+        visibleArea < 30000.0 ||
+        (windowArea > 1.0 && (visibleArea / windowArea) < 0.12)) {
+        return NO;
+    }
+
+    if (visibleAreaOut) {
+        *visibleAreaOut = visibleArea;
+    }
+
+    return YES;
 }
 
-static AVPlayerLayer *MSHFindVisiblePlayerLayerInLayer(CALayer *layer,
-                                                       AVPlayer *player,
-                                                       UIWindow *window) {
+static void MSHFindBestVisiblePlayerLayerRecursive(CALayer *layer,
+                                                    UIWindow *window,
+                                                    AVPlayerLayer **bestLayer,
+                                                    CGFloat *bestArea) {
     if (!layer || layer.hidden || layer.opacity < 0.02) {
-        return nil;
+        return;
     }
 
     if ([layer isKindOfClass:[AVPlayerLayer class]]) {
         AVPlayerLayer *playerLayer = (AVPlayerLayer *)layer;
+        CGFloat visibleArea = 0.0;
 
-        if (playerLayer.player == player &&
-            MSHPlayerLayerIsActuallyVisible(playerLayer, window)) {
-            return playerLayer;
+        if (MSHLayerIsActuallyVisible(playerLayer, window, &visibleArea) &&
+            visibleArea > *bestArea) {
+            *bestArea = visibleArea;
+            *bestLayer = playerLayer;
         }
     }
 
     for (CALayer *sublayer in layer.sublayers) {
-        AVPlayerLayer *found = MSHFindVisiblePlayerLayerInLayer(sublayer, player, window);
-        if (found) {
-            return found;
-        }
+        MSHFindBestVisiblePlayerLayerRecursive(sublayer,
+                                               window,
+                                               bestLayer,
+                                               bestArea);
     }
-
-    return nil;
 }
 
-static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
-    if (!player) {
-        return nil;
-    }
+static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
+    AVPlayerLayer *bestLayer = nil;
+    CGFloat bestArea = 0.0;
 
     for (UIWindow *window in MSHForegroundWindows()) {
-        AVPlayerLayer *found = MSHFindVisiblePlayerLayerInLayer(window.layer, player, window);
-        if (found) {
-            return found;
-        }
+        MSHFindBestVisiblePlayerLayerRecursive(window.layer,
+                                               window,
+                                               &bestLayer,
+                                               &bestArea);
     }
 
-    return nil;
+    return bestLayer;
 }
 
 @interface MSHProgressManager : NSObject <UIGestureRecognizerDelegate>
@@ -225,6 +245,7 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
 @property (nonatomic, assign) BOOL userTracking;
 @property (nonatomic, assign) BOOL userHidden;
 @property (nonatomic, assign) BOOL videoWasVisible;
+@property (nonatomic, assign) CFTimeInterval lastTapToggleTime;
 
 @end
 
@@ -296,11 +317,17 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
         return;
     }
 
-    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.30
-                                                        target:self
-                                                      selector:@selector(refreshTimerFired:)
-                                                      userInfo:nil
-                                                       repeats:YES];
+    /*
+     * This timer actively scans the visible layer tree.
+     * It fixes the old behaviour where the tweak sometimes waited until
+     * the stock Photos scrubber was touched before discovering AVPlayer.
+     */
+    self.refreshTimer =
+        [NSTimer scheduledTimerWithTimeInterval:0.20
+                                        target:self
+                                      selector:@selector(refreshTimerFired:)
+                                      userInfo:nil
+                                       repeats:YES];
 }
 
 - (void)stopRefreshTimer {
@@ -327,7 +354,12 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
         return;
     }
 
-    if (player != self.player) {
+    /*
+     * Hook-based discovery is retained as a fast path.
+     * refreshNow also performs an independent visible-layer scan, so the
+     * tweak no longer relies on these methods being called after injection.
+     */
+    if (player != self.player && MSHPlayerItemHasUsableDuration(player)) {
         [self bindPlayer:player];
     }
 
@@ -349,10 +381,7 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
     self.periodicTimeObserver = nil;
     self.player = player;
     self.lastPlayerItem = nil;
-    self.visiblePlayerLayer = nil;
     self.userTracking = NO;
-    self.userHidden = NO;
-    self.videoWasVisible = NO;
 
     if (!player) {
         [self setBarVisible:NO];
@@ -387,20 +416,23 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
         container.userInteractionEnabled = YES;
         container.layer.cornerRadius = 12.0;
         container.layer.masksToBounds = YES;
-        container.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.46];
+        container.backgroundColor =
+            [UIColor.blackColor colorWithAlphaComponent:0.46];
 
         UILabel *currentLabel = [UILabel new];
         currentLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        currentLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.0
-                                                            weight:UIFontWeightMedium];
+        currentLabel.font =
+            [UIFont monospacedDigitSystemFontOfSize:11.0
+                                             weight:UIFontWeightMedium];
         currentLabel.textColor = UIColor.whiteColor;
         currentLabel.textAlignment = NSTextAlignmentLeft;
         currentLabel.text = @"0:00";
 
         UILabel *durationLabel = [UILabel new];
         durationLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        durationLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.0
-                                                             weight:UIFontWeightMedium];
+        durationLabel.font =
+            [UIFont monospacedDigitSystemFontOfSize:11.0
+                                             weight:UIFontWeightMedium];
         durationLabel.textColor = UIColor.whiteColor;
         durationLabel.textAlignment = NSTextAlignmentRight;
         durationLabel.text = @"0:00";
@@ -411,7 +443,8 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
         slider.maximumValue = 1.0f;
         slider.continuous = YES;
         slider.minimumTrackTintColor = UIColor.whiteColor;
-        slider.maximumTrackTintColor = [UIColor.whiteColor colorWithAlphaComponent:0.32];
+        slider.maximumTrackTintColor =
+            [UIColor.whiteColor colorWithAlphaComponent:0.32];
         slider.thumbTintColor = UIColor.whiteColor;
         slider.accessibilityLabel = @"视频进度";
 
@@ -441,16 +474,20 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
         [container addSubview:slider];
 
         [NSLayoutConstraint activateConstraints:@[
-            [currentLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:12.0],
+            [currentLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor
+                                                       constant:12.0],
             [currentLabel.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
             [currentLabel.widthAnchor constraintEqualToConstant:42.0],
 
-            [durationLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-12.0],
+            [durationLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor
+                                                         constant:-12.0],
             [durationLabel.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
             [durationLabel.widthAnchor constraintEqualToConstant:42.0],
 
-            [slider.leadingAnchor constraintEqualToAnchor:currentLabel.trailingAnchor constant:6.0],
-            [slider.trailingAnchor constraintEqualToAnchor:durationLabel.leadingAnchor constant:-6.0],
+            [slider.leadingAnchor constraintEqualToAnchor:currentLabel.trailingAnchor
+                                                 constant:6.0],
+            [slider.trailingAnchor constraintEqualToAnchor:durationLabel.leadingAnchor
+                                                  constant:-6.0],
             [slider.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
             [slider.heightAnchor constraintEqualToConstant:32.0]
         ]];
@@ -470,9 +507,14 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
 
         [window addSubview:self.barContainer];
 
+        /*
+         * Move the custom bar higher than Photos' stock scrubber.
+         * Portrait: 118 pt above safe-area bottom
+         * Landscape: 72 pt above safe-area bottom
+         */
         NSLayoutConstraint *bottom =
             [self.barContainer.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor
-                                                           constant:-64.0];
+                                                           constant:-118.0];
 
         [NSLayoutConstraint activateConstraints:@[
             [self.barContainer.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor
@@ -491,6 +533,7 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
                                                     action:@selector(screenTapped:)];
 
         screenTap.delegate = self;
+        screenTap.numberOfTapsRequired = 1;
         screenTap.cancelsTouchesInView = NO;
         screenTap.delaysTouchesBegan = NO;
         screenTap.delaysTouchesEnded = NO;
@@ -499,8 +542,10 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
         self.screenTapGesture = screenTap;
     }
 
-    BOOL landscape = CGRectGetWidth(window.bounds) > CGRectGetHeight(window.bounds);
-    self.bottomConstraint.constant = landscape ? -18.0 : -64.0;
+    BOOL landscape =
+        CGRectGetWidth(window.bounds) > CGRectGetHeight(window.bounds);
+
+    self.bottomConstraint.constant = landscape ? -72.0 : -118.0;
 
     [window bringSubviewToFront:self.barContainer];
 }
@@ -539,54 +584,45 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
     }
 }
 
-- (BOOL)videoIsActuallyVisible {
-    AVPlayer *player = self.player;
-
-    if (!player || !MSHPlayerItemIsUsableVideo(player)) {
+- (void)refreshNow {
+    if (UIApplication.sharedApplication.applicationState !=
+        UIApplicationStateActive) {
+        self.videoWasVisible = NO;
         self.visiblePlayerLayer = nil;
-        return NO;
+        [self setBarVisible:NO];
+        return;
     }
 
-    AVPlayerLayer *visibleLayer = MSHFindVisiblePlayerLayer(player);
+    /*
+     * Actively find the largest real AVPlayerLayer currently visible.
+     * This does not depend on the stock Photos timeline being touched first.
+     */
+    AVPlayerLayer *visibleLayer = MSHFindBestVisiblePlayerLayer();
 
-    if (!visibleLayer) {
+    if (!visibleLayer ||
+        !visibleLayer.player ||
+        !MSHPlayerItemHasUsableDuration(visibleLayer.player)) {
+        self.videoWasVisible = NO;
         self.visiblePlayerLayer = nil;
-        return NO;
+        [self setBarVisible:NO];
+        return;
     }
 
     self.visiblePlayerLayer = visibleLayer;
-    return YES;
-}
 
-- (void)refreshNow {
-    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
-        self.videoWasVisible = NO;
-        [self setBarVisible:NO];
-        return;
+    AVPlayer *visiblePlayer = visibleLayer.player;
+
+    if (visiblePlayer != self.player) {
+        [self bindPlayer:visiblePlayer];
+        self.userHidden = NO;
     }
 
-    AVPlayer *player = self.player;
-
-    if (!player) {
-        self.videoWasVisible = NO;
-        [self setBarVisible:NO];
-        return;
-    }
-
-    AVPlayerItem *currentItem = player.currentItem;
+    AVPlayerItem *currentItem = visiblePlayer.currentItem;
 
     if (currentItem != self.lastPlayerItem) {
         self.lastPlayerItem = currentItem;
         self.userHidden = NO;
         self.userTracking = NO;
-    }
-
-    BOOL visibleVideo = [self videoIsActuallyVisible];
-
-    if (!visibleVideo) {
-        self.videoWasVisible = NO;
-        [self setBarVisible:NO];
-        return;
     }
 
     if (!self.videoWasVisible) {
@@ -603,7 +639,6 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
 
     [self ensureBarInWindow:window];
     [self updateProgress];
-
     [self setBarVisible:!self.userHidden];
 }
 
@@ -611,7 +646,7 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
     AVPlayer *player = self.player;
     AVPlayerItem *item = player.currentItem;
 
-    if (!player || !item || !MSHPlayerItemIsUsableVideo(player)) {
+    if (!player || !item || !MSHPlayerItemHasUsableDuration(player)) {
         [self setBarVisible:NO];
         return;
     }
@@ -717,14 +752,23 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
 }
 
 - (void)screenTapped:(UITapGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateEnded) {
+    if (gesture.state != UIGestureRecognizerStateEnded ||
+        !self.videoWasVisible ||
+        !self.visiblePlayerLayer) {
         return;
     }
 
-    if (![self videoIsActuallyVisible]) {
+    /*
+     * Photos itself may have several simultaneous single-tap recognizers.
+     * Debouncing prevents one physical tap from toggling our state twice.
+     */
+    CFTimeInterval now = CACurrentMediaTime();
+
+    if ((now - self.lastTapToggleTime) < 0.32) {
         return;
     }
 
+    self.lastTapToggleTime = now;
     self.userHidden = !self.userHidden;
     [self setBarVisible:!self.userHidden];
 }
@@ -732,6 +776,10 @@ static AVPlayerLayer *MSHFindVisiblePlayerLayer(AVPlayer *player) {
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
        shouldReceiveTouch:(UITouch *)touch {
     UIView *touchedView = touch.view;
+
+    if (!self.videoWasVisible || !self.visiblePlayerLayer) {
+        return NO;
+    }
 
     if (!touchedView) {
         return YES;
