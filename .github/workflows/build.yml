@@ -1,0 +1,79 @@
+name: Build MobileSlideShowHook
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_scheme:
+        description: "选择编译类型"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - rootless
+          - roothide
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ inputs.build_scheme }}
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        uses: waruhachi/theos-action@v2.4.10
+        with:
+          theos-src: "roothide/theos"
+          theos-branch: "master"
+          sdks-src: "theos/sdks"
+          sdks-branch: "master"
+          libgcuniversal: "false"
+          altlist: "false"
+          comet: "false"
+          orion: "false"
+
+      - name: Prepare output
+        run: |
+          rm -rf artifacts
+          mkdir -p artifacts/rootless artifacts/roothide
+
+      - name: Build rootless
+        if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'rootless' }}
+        run: |
+          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64/' control
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          cp -v packages/*.deb artifacts/rootless/
+
+      - name: Build roothide
+        if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'roothide' }}
+        run: |
+          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64e/' control
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+          cp -v packages/*.deb artifacts/roothide/
+
+      - name: Show packages
+        run: |
+          find artifacts -type f -name "*.deb" -print
+
+      - name: Upload rootless
+        if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'rootless' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileSlideShowHook-rootless
+          path: artifacts/rootless/*.deb
+          if-no-files-found: error
+
+      - name: Upload roothide
+        if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'roothide' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileSlideShowHook-roothide
+          path: artifacts/roothide/*.deb
+          if-no-files-found: error
