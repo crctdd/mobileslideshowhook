@@ -13,17 +13,6 @@
     return CGRectContainsPoint(expanded, point);
 }
 
-- (BOOL)beginTracking:(UITouch *)touch withEvent:(UIEvent *)event {
-    CGPoint point = [touch locationInView:self];
-    if (CGRectGetWidth(self.bounds) > 0.0) {
-        CGFloat ratio = MIN(MAX(point.x / CGRectGetWidth(self.bounds), 0.0), 1.0);
-        float value = self.minimumValue + (self.maximumValue - self.minimumValue) * ratio;
-        [self setValue:value animated:NO];
-        [self sendActionsForControlEvents:UIControlEventValueChanged];
-    }
-    return [super beginTracking:touch withEvent:event];
-}
-
 @end
 
 @interface MSHPlayerCandidate : NSObject
@@ -112,22 +101,61 @@ static void MSHInspectViewTree(UIView *view, MSHPlayerCandidate *candidate) {
     }
 }
 
+static NSArray<UIWindow *> *MSHSceneWindows(UIApplication *application) {
+    NSMutableArray<UIWindow *> *foregroundWindows = [NSMutableArray array];
+    NSMutableArray<UIWindow *> *otherWindows = [NSMutableArray array];
+
+    for (UIScene *scene in application.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        BOOL foreground =
+            (scene.activationState == UISceneActivationStateForegroundActive ||
+             scene.activationState == UISceneActivationStateForegroundInactive);
+
+        for (UIWindow *window in windowScene.windows) {
+            if (foreground) {
+                [foregroundWindows addObject:window];
+            } else {
+                [otherWindows addObject:window];
+            }
+        }
+    }
+
+    if (foregroundWindows.count > 0) {
+        return foregroundWindows;
+    }
+
+    return otherWindows;
+}
+
 static UIWindow *MSHCurrentWindow(void) {
     UIApplication *application = UIApplication.sharedApplication;
+    NSArray<UIWindow *> *windows = MSHSceneWindows(application);
 
-    for (UIWindow *window in application.windows) {
+    for (UIWindow *window in windows) {
         if (window.isKeyWindow && !window.hidden && window.alpha > 0.02) {
             return window;
         }
     }
 
-    for (UIWindow *window in application.windows) {
-        if (!window.hidden && window.alpha > 0.02 && window.windowLevel == UIWindowLevelNormal) {
+    for (UIWindow *window in windows) {
+        if (!window.hidden &&
+            window.alpha > 0.02 &&
+            window.windowLevel == UIWindowLevelNormal) {
             return window;
         }
     }
 
-    return application.windows.firstObject;
+    for (UIWindow *window in windows) {
+        if (!window.hidden && window.alpha > 0.02) {
+            return window;
+        }
+    }
+
+    return nil;
 }
 
 @interface MSHProgressManager : NSObject
@@ -223,15 +251,9 @@ static UIWindow *MSHCurrentWindow(void) {
         slider.hidden = YES;
         slider.accessibilityLabel = @"视频进度";
 
-        if (@available(iOS 13.0, *)) {
-            slider.minimumTrackTintColor = UIColor.labelColor;
-            slider.maximumTrackTintColor = [UIColor.labelColor colorWithAlphaComponent:0.28];
-            slider.thumbTintColor = UIColor.labelColor;
-        } else {
-            slider.minimumTrackTintColor = UIColor.whiteColor;
-            slider.maximumTrackTintColor = [UIColor.whiteColor colorWithAlphaComponent:0.28];
-            slider.thumbTintColor = UIColor.whiteColor;
-        }
+        slider.minimumTrackTintColor = UIColor.labelColor;
+        slider.maximumTrackTintColor = [UIColor.labelColor colorWithAlphaComponent:0.28];
+        slider.thumbTintColor = UIColor.labelColor;
 
         [slider addTarget:self
                    action:@selector(sliderTouchDown:)
@@ -341,6 +363,7 @@ static UIWindow *MSHCurrentWindow(void) {
         if (!strongSelf) {
             return;
         }
+
         [strongSelf refreshSliderFromPlayer];
     }];
 
@@ -373,6 +396,7 @@ static UIWindow *MSHCurrentWindow(void) {
 
     if (!self.userTracking) {
         double current = CMTimeGetSeconds(player.currentTime);
+
         if (isfinite(current)) {
             current = MIN(MAX(current, 0.0), duration);
             [self.slider setValue:(float)current animated:NO];
@@ -396,12 +420,14 @@ static UIWindow *MSHCurrentWindow(void) {
 
 - (void)sliderTouchEnded:(UISlider *)slider {
     AVPlayer *player = self.player;
+
     if (!player) {
         self.userTracking = NO;
         return;
     }
 
     double seconds = slider.value;
+
     if (!isfinite(seconds) || seconds < 0.0) {
         self.userTracking = NO;
         return;
@@ -411,13 +437,19 @@ static UIWindow *MSHCurrentWindow(void) {
     CMTime tolerance = CMTimeMakeWithSeconds(0.05, 600);
 
     __weak typeof(self) weakSelf = self;
+
     [player seekToTime:target
        toleranceBefore:tolerance
         toleranceAfter:tolerance
      completionHandler:^(__unused BOOL finished) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.userTracking = NO;
-            [weakSelf refreshSliderFromPlayer];
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+
+            strongSelf.userTracking = NO;
+            [strongSelf refreshSliderFromPlayer];
         });
     }];
 }
@@ -442,6 +474,7 @@ static UIWindow *MSHCurrentWindow(void) {
 
     if (now - lastScan > 0.20) {
         lastScan = now;
+
         dispatch_async(dispatch_get_main_queue(), ^{
             [[MSHProgressManager sharedManager] scanNow];
         });
