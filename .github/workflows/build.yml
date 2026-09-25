@@ -45,18 +45,36 @@ jobs:
       - name: Build rootless
         if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'rootless' }}
         run: |
+          rm -rf packages
+          mkdir -p packages
           sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64/' control
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          cp -v packages/*.deb artifacts/rootless/
+          ROOTLESS_DEB="$(find packages -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          test -n "$ROOTLESS_DEB"
+          cp -v "$ROOTLESS_DEB" artifacts/rootless/
 
       - name: Build roothide
         if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'roothide' }}
         run: |
+          rm -rf packages
+          mkdir -p packages
           sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm64e/' control
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
-          cp -v packages/*.deb artifacts/roothide/
+          ROOTHIDE_DEB="$(find packages -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          test -n "$ROOTHIDE_DEB"
+          cp -v "$ROOTHIDE_DEB" artifacts/roothide/
+
+      - name: Verify rootless artifact
+        if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'rootless' }}
+        run: |
+          test "$(find artifacts/rootless -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d ' ')" = "1"
+
+      - name: Verify roothide artifact
+        if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'roothide' }}
+        run: |
+          test "$(find artifacts/roothide -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d ' ')" = "1"
 
       - name: Upload rootless
         if: ${{ inputs.build_scheme == 'all' || inputs.build_scheme == 'rootless' }}

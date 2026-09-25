@@ -7,17 +7,13 @@
 - 注入：`com.apple.mobileslideshow`
 - 无设置面板
 
-## 这一版的播放器识别方式
+## 本次调整
 
-不再只扫描 UIView/CALayer 树寻找播放器。
-
-现在同时 Hook：
-
-- `AVPlayerLayer`
-- `AVPlayerViewController`
-- `AVPlayer`
-
-当系统相册把视频播放器交给 AVFoundation/AVKit 时直接捕获播放器，再把自定义进度条与该播放器绑定。
+1. 只有当前页面存在真正可见的 `AVPlayerLayer`，且 `AVPlayerItem.presentationSize` 为有效视频尺寸时才显示进度条。
+2. 从视频切换到普通照片后，检测不到可见视频层会立即隐藏进度条。
+3. 观看视频时单击画面可隐藏自定义进度条，再单击一次恢复。
+4. 点击进度条自身或系统按钮时，不触发隐藏/显示切换。
+5. GitHub Actions 每次构建前清空 `packages`，并强制每个 artifact 只保留一个 `.deb`，解决 `roothide` 下载后出现两个包的问题。
 
 ## GitHub Actions
 
@@ -29,4 +25,4 @@ Actions → Build MobileSlideShowHook → Run workflow
 - `rootless`
 - `roothide`
 
-安装后完全退出系统相册，再重新打开测试。
+安装后彻底退出系统相册，再重新打开测试。
