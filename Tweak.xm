@@ -311,18 +311,21 @@ static BOOL MSHLayerIsActuallyVisible(AVPlayerLayer *playerLayer,
     CGFloat visibleWidth = CGRectGetWidth(intersection);
     CGFloat visibleHeight = CGRectGetHeight(intersection);
     CGFloat visibleArea = visibleWidth * visibleHeight;
-    CGFloat windowArea =
-        CGRectGetWidth(window.bounds) * CGRectGetHeight(window.bounds);
+    CGFloat layerRectArea =
+        fabs(CGRectGetWidth(rectInWindowLayer) *
+             CGRectGetHeight(rectInWindowLayer));
 
     /*
      * Photos may keep neighbouring video players alive while paging.
-     * Requiring a meaningful on-screen area prevents an off-screen or
-     * tiny preloaded player from making the progress bar appear on photos.
+     * Compare the visible area with the player layer itself, not the whole
+     * window. A portrait video in landscape (and vice versa) legitimately
+     * occupies much less than 35% of the screen because of letterboxing.
      */
     if (visibleWidth < 100.0 ||
         visibleHeight < 100.0 ||
         visibleArea < 30000.0 ||
-        (windowArea > 1.0 && (visibleArea / windowArea) < 0.35)) {
+        layerRectArea <= 1.0 ||
+        (visibleArea / layerRectArea) < 0.65) {
         return NO;
     }
 
@@ -428,11 +431,14 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 @property (nonatomic, strong) NSLayoutConstraint *bottomConstraint;
 @property (nonatomic, copy) NSArray<NSLayoutConstraint *> *hostConstraints;
 @property (nonatomic, strong) UIPanGestureRecognizer *dismissPanGesture;
+@property (nonatomic, strong) UITapGestureRecognizer *screenTapGesture;
 @property (nonatomic, assign) BOOL userTracking;
 @property (nonatomic, assign) BOOL videoWasVisible;
 @property (nonatomic, assign) BOOL refreshScheduled;
 @property (nonatomic, assign) BOOL dismissGestureActive;
 @property (nonatomic, assign) NSUInteger dismissGestureSession;
+@property (nonatomic, assign) BOOL landscapeUserHidden;
+@property (nonatomic, assign) BOOL lastLayoutWasLandscape;
 @property (nonatomic, assign) double lastRenderedTime;
 @property (nonatomic, assign) BOOL scrubSeekInFlight;
 @property (nonatomic, assign) BOOL scrubSeekPending;
@@ -623,6 +629,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     self.scrubSeekPending = NO;
     self.scrubEnding = NO;
     self.resumeAfterScrub = NO;
+    self.landscapeUserHidden = NO;
 
     if (!player) {
         self.displayLink.paused = YES;
@@ -735,6 +742,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
             self.barContainer.alpha = 1.0;
         }
 
+        if (self.screenTapGesture && self.hostWindow) {
+            [self.hostWindow removeGestureRecognizer:self.screenTapGesture];
+            self.screenTapGesture = nil;
+        }
+
         if (self.hostConstraints.count > 0) {
             [NSLayoutConstraint deactivateConstraints:self.hostConstraints];
             self.hostConstraints = nil;
@@ -777,6 +789,18 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         dismissPan.delaysTouchesEnded = NO;
         [window addGestureRecognizer:dismissPan];
         self.dismissPanGesture = dismissPan;
+    }
+
+    if (!self.screenTapGesture) {
+        UITapGestureRecognizer *screenTap =
+            [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(screenTapped:)];
+        screenTap.delegate = self;
+        screenTap.cancelsTouchesInView = NO;
+        screenTap.delaysTouchesBegan = NO;
+        screenTap.delaysTouchesEnded = NO;
+        [window addGestureRecognizer:screenTap];
+        self.screenTapGesture = screenTap;
     }
 
     BOOL landscape =
@@ -872,6 +896,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.lastPlayerItem = currentItem;
         self.userTracking = NO;
         self.lastRenderedTime = NAN;
+        self.landscapeUserHidden = NO;
     }
 
     if (!self.videoWasVisible) {
@@ -881,26 +906,47 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     [self ensureBarInWindow:playerWindow];
     [self updateProgress];
 
-    /*
-     * Do not maintain a separate tap state anymore.
-     * The tweak follows Photos' own chrome: when the user taps and Photos
-     * hides its native controls/scrubber, our bar hides too; when Photos'
-     * controls return, our bar returns with them.
-     */
+    /* Portrait follows Photos' chrome; landscape mirrors screen taps. */
     BOOL landscape =
         CGRectGetWidth(playerWindow.bounds) > CGRectGetHeight(playerWindow.bounds);
+
+    if (landscape != self.lastLayoutWasLandscape) {
+        self.lastLayoutWasLandscape = landscape;
+        self.landscapeUserHidden = NO;
+    }
 
     /*
      * Photos uses a different control hierarchy in landscape on some iOS
      * releases, so the chrome-name heuristic can return false even while a
      * video is active. Keep the custom bar available in landscape.
      */
-    BOOL shouldShowBar =
-        landscape || MSHPhotosChromeIsVisibleInWindow(playerWindow);
+    BOOL shouldShowBar = landscape
+        ? !self.landscapeUserHidden
+        : MSHPhotosChromeIsVisibleInWindow(playerWindow);
 
     if (!self.dismissGestureActive) {
         [self setBarVisible:shouldShowBar];
     }
+}
+
+- (void)screenTapped:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded ||
+        !self.videoWasVisible ||
+        self.dismissGestureActive ||
+        !self.hostWindow) {
+        return;
+    }
+
+    BOOL landscape =
+        CGRectGetWidth(self.hostWindow.bounds) >
+        CGRectGetHeight(self.hostWindow.bounds);
+
+    if (!landscape) {
+        return;
+    }
+
+    self.landscapeUserHidden = !self.landscapeUserHidden;
+    [self setBarVisible:!self.landscapeUserHidden];
 }
 
 - (void)dismissPanChanged:(UIPanGestureRecognizer *)gesture {
@@ -980,9 +1026,22 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 }
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
-    if (gestureRecognizer != self.dismissPanGesture ||
-        !self.videoWasVisible ||
-        self.barContainer.hidden) {
+    if (gestureRecognizer == self.screenTapGesture) {
+        if (!self.videoWasVisible ||
+            self.dismissGestureActive ||
+            !self.hostWindow) {
+            return NO;
+        }
+
+        return CGRectGetWidth(self.hostWindow.bounds) >
+               CGRectGetHeight(self.hostWindow.bounds);
+    }
+
+    if (gestureRecognizer != self.dismissPanGesture) {
+        return YES;
+    }
+
+    if (!self.videoWasVisible || self.barContainer.hidden) {
         return NO;
     }
 
@@ -995,7 +1054,8 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
        shouldReceiveTouch:(UITouch *)touch {
-    if (gestureRecognizer != self.dismissPanGesture) {
+    if (gestureRecognizer != self.dismissPanGesture &&
+        gestureRecognizer != self.screenTapGesture) {
         return YES;
     }
 
@@ -1016,7 +1076,9 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
 shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
     return gestureRecognizer == self.dismissPanGesture ||
-           otherGestureRecognizer == self.dismissPanGesture;
+           otherGestureRecognizer == self.dismissPanGesture ||
+           gestureRecognizer == self.screenTapGesture ||
+           otherGestureRecognizer == self.screenTapGesture;
 }
 
 - (void)updateProgress {
