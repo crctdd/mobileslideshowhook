@@ -213,6 +213,90 @@ static BOOL MSHPhotosChromeIsVisibleInWindow(UIWindow *window) {
     return window && MSHPhotosChromeVisibleInView(window);
 }
 
+typedef struct {
+    BOOL found;
+    BOOL visible;
+} MSHPlaybackChromeState;
+
+static BOOL MSHClassNameLooksLikePlaybackChrome(UIView *view) {
+    NSString *className = NSStringFromClass(view.class);
+
+    if (className.length == 0) {
+        return NO;
+    }
+
+    static NSArray<NSString *> *tokens;
+    static dispatch_once_t onceToken;
+
+    dispatch_once(&onceToken, ^{
+        tokens = @[
+            @"Scrubber",
+            @"Filmstrip",
+            @"Timeline",
+            @"PlaybackControl",
+            @"PlayerControl",
+            @"VideoControl",
+            @"TransportControl",
+            @"ControlBar"
+        ];
+    });
+
+    for (NSString *token in tokens) {
+        if ([className rangeOfString:token
+                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static void MSHFindPlaybackChromeState(UIView *view,
+                                       UIView *excludedRoot,
+                                       MSHPlaybackChromeState *state) {
+    if (!view || view == excludedRoot || state->visible) {
+        return;
+    }
+
+    BOOL candidate =
+        MSHClassNameLooksLikePlaybackChrome(view) ||
+        ([view isKindOfClass:[UISlider class]] &&
+         ![view isKindOfClass:[MSHProgressSlider class]]);
+
+    if (candidate) {
+        state->found = YES;
+
+        CGRect bounds = view.bounds;
+
+        if (CGRectGetWidth(bounds) > 80.0 &&
+            CGRectGetHeight(bounds) > 8.0 &&
+            MSHViewAndAncestorsAreVisible(view)) {
+            state->visible = YES;
+            return;
+        }
+    }
+
+    for (UIView *subview in view.subviews) {
+        MSHFindPlaybackChromeState(subview, excludedRoot, state);
+
+        if (state->visible) {
+            return;
+        }
+    }
+}
+
+static MSHPlaybackChromeState MSHPlaybackChromeStateInWindow(
+    UIWindow *window,
+    UIView *excludedRoot) {
+    MSHPlaybackChromeState state = { NO, NO };
+
+    if (window) {
+        MSHFindPlaybackChromeState(window, excludedRoot, &state);
+    }
+
+    return state;
+}
+
 static BOOL MSHViewIsActuallyVisible(UIView *view) {
     if (!view || !view.window || view.hidden || view.alpha < 0.02) {
         return NO;
@@ -437,6 +521,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 @property (nonatomic, assign) BOOL refreshScheduled;
 @property (nonatomic, assign) BOOL dismissGestureActive;
 @property (nonatomic, assign) NSUInteger dismissGestureSession;
+@property (nonatomic, assign) NSUInteger screenTapSession;
 @property (nonatomic, assign) BOOL landscapeUserHidden;
 @property (nonatomic, assign) BOOL lastLayoutWasLandscape;
 @property (nonatomic, assign) double lastRenderedTime;
@@ -512,6 +597,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         [self stopRefreshTimer];
         self.displayLink.paused = YES;
         self.dismissGestureSession++;
+        self.screenTapSession++;
         self.dismissGestureActive = NO;
         self.barContainer.transform = CGAffineTransformIdentity;
         self.barContainer.alpha = 1.0;
@@ -745,6 +831,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         if (self.screenTapGesture && self.hostWindow) {
             [self.hostWindow removeGestureRecognizer:self.screenTapGesture];
             self.screenTapGesture = nil;
+            self.screenTapSession++;
         }
 
         if (self.hostConstraints.count > 0) {
@@ -906,7 +993,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     [self ensureBarInWindow:playerWindow];
     [self updateProgress];
 
-    /* Portrait follows Photos' chrome; landscape mirrors screen taps. */
+    /* Follow the native Photos playback chrome whenever it can be found. */
     BOOL landscape =
         CGRectGetWidth(playerWindow.bounds) > CGRectGetHeight(playerWindow.bounds);
 
@@ -915,14 +1002,18 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.landscapeUserHidden = NO;
     }
 
-    /*
-     * Photos uses a different control hierarchy in landscape on some iOS
-     * releases, so the chrome-name heuristic can return false even while a
-     * video is active. Keep the custom bar available in landscape.
-     */
-    BOOL shouldShowBar = landscape
-        ? !self.landscapeUserHidden
-        : MSHPhotosChromeIsVisibleInWindow(playerWindow);
+    MSHPlaybackChromeState chromeState =
+        MSHPlaybackChromeStateInWindow(playerWindow, self.barContainer);
+    BOOL shouldShowBar;
+
+    if (chromeState.found) {
+        shouldShowBar = chromeState.visible;
+        self.landscapeUserHidden = !chromeState.visible;
+    } else {
+        shouldShowBar = landscape
+            ? !self.landscapeUserHidden
+            : MSHPhotosChromeIsVisibleInWindow(playerWindow);
+    }
 
     if (!self.dismissGestureActive) {
         [self setBarVisible:shouldShowBar];
@@ -937,16 +1028,46 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         return;
     }
 
-    BOOL landscape =
-        CGRectGetWidth(self.hostWindow.bounds) >
-        CGRectGetHeight(self.hostWindow.bounds);
+    self.screenTapSession++;
+    NSUInteger tapSession = self.screenTapSession;
+    NSUInteger dismissSession = self.dismissGestureSession;
 
-    if (!landscape) {
-        return;
-    }
+    /* Let Photos apply its own tap state first, then mirror the real chrome. */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (tapSession != self.screenTapSession ||
+            dismissSession != self.dismissGestureSession ||
+            !self.videoWasVisible ||
+            self.dismissGestureActive ||
+            !self.hostWindow) {
+            return;
+        }
 
-    self.landscapeUserHidden = !self.landscapeUserHidden;
-    [self setBarVisible:!self.landscapeUserHidden];
+        MSHPlaybackChromeState chromeState =
+            MSHPlaybackChromeStateInWindow(self.hostWindow,
+                                           self.barContainer);
+        BOOL landscape =
+            CGRectGetWidth(self.hostWindow.bounds) >
+            CGRectGetHeight(self.hostWindow.bounds);
+
+        if (chromeState.found) {
+            self.landscapeUserHidden = !chromeState.visible;
+            [self setBarVisible:chromeState.visible];
+        } else if (landscape) {
+            self.landscapeUserHidden = !self.landscapeUserHidden;
+            [self setBarVisible:!self.landscapeUserHidden];
+        } else {
+            [self refreshNow];
+        }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(0.12 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (tapSession == self.screenTapSession &&
+                dismissSession == self.dismissGestureSession) {
+                [self refreshNow];
+            }
+        });
+    });
 }
 
 - (void)dismissPanChanged:(UIPanGestureRecognizer *)gesture {
@@ -1033,8 +1154,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
             return NO;
         }
 
-        return CGRectGetWidth(self.hostWindow.bounds) >
-               CGRectGetHeight(self.hostWindow.bounds);
+        return YES;
     }
 
     if (gestureRecognizer != self.dismissPanGesture) {
