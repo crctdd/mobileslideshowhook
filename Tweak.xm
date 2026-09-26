@@ -1,6 +1,5 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
-#import <AVKit/AVKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <math.h>
 
@@ -28,7 +27,68 @@ static BOOL MSHPlayerItemHasUsableDuration(AVPlayer *player) {
     }
 
     double duration = CMTimeGetSeconds(durationTime);
-    return isfinite(duration) && duration > 0.25;
+    if (!isfinite(duration) || duration <= 0.25) {
+        return NO;
+    }
+
+    CGSize presentationSize = item.presentationSize;
+    return presentationSize.width > 1.0 && presentationSize.height > 1.0;
+}
+
+static BOOL MSHObjectLooksLikeLivePhotoHost(id object) {
+    if (!object) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass([object class]);
+    return [className rangeOfString:@"LivePhoto"
+                            options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static BOOL MSHViewBelongsToLivePhoto(UIView *view) {
+    UIResponder *responder = view;
+    NSUInteger depth = 0;
+
+    /*
+     * Public PHLivePhotoView and Photos' private Live Photo containers all
+     * contain "LivePhoto" in their class names on the supported releases.
+     * Walking the responder chain also catches the private view controller
+     * when the AVPlayerLayer's immediate delegate is only a helper view.
+     */
+    while (responder && depth < 64) {
+        if (MSHObjectLooksLikeLivePhotoHost(responder)) {
+            return YES;
+        }
+
+        responder = responder.nextResponder;
+        depth++;
+    }
+
+    return NO;
+}
+
+static BOOL MSHLayerBelongsToLivePhoto(CALayer *layer) {
+    CALayer *cursor = layer;
+    NSUInteger depth = 0;
+
+    while (cursor && depth < 128) {
+        if (MSHObjectLooksLikeLivePhotoHost(cursor)) {
+            return YES;
+        }
+
+        id delegate = cursor.delegate;
+
+        if (MSHObjectLooksLikeLivePhotoHost(delegate) ||
+            ([delegate isKindOfClass:[UIView class]] &&
+             MSHViewBelongsToLivePhoto((UIView *)delegate))) {
+            return YES;
+        }
+
+        cursor = cursor.superlayer;
+        depth++;
+    }
+
+    return NO;
 }
 
 static NSArray<UIWindow *> *MSHForegroundWindows(void) {
@@ -55,24 +115,6 @@ static NSArray<UIWindow *> *MSHForegroundWindows(void) {
     }
 
     return result;
-}
-
-static UIWindow *MSHBestWindow(void) {
-    NSArray<UIWindow *> *windows = MSHForegroundWindows();
-
-    for (UIWindow *window in windows) {
-        if (window.isKeyWindow) {
-            return window;
-        }
-    }
-
-    for (UIWindow *window in windows) {
-        if (window.windowLevel == UIWindowLevelNormal) {
-            return window;
-        }
-    }
-
-    return windows.firstObject;
 }
 
 static BOOL MSHViewAndAncestorsAreVisible(UIView *view) {
@@ -167,14 +209,8 @@ static BOOL MSHPhotosChromeVisibleInView(UIView *view) {
     return NO;
 }
 
-static BOOL MSHPhotosChromeIsVisible(void) {
-    for (UIWindow *window in MSHForegroundWindows()) {
-        if (MSHPhotosChromeVisibleInView(window)) {
-            return YES;
-        }
-    }
-
-    return NO;
+static BOOL MSHPhotosChromeIsVisibleInWindow(UIWindow *window) {
+    return window && MSHPhotosChromeVisibleInView(window);
 }
 
 static BOOL MSHViewIsActuallyVisible(UIView *view) {
@@ -214,6 +250,7 @@ static BOOL MSHLayerIsActuallyVisible(AVPlayerLayer *playerLayer,
         !window ||
         !playerLayer.player ||
         !MSHPlayerItemHasUsableDuration(playerLayer.player) ||
+        MSHLayerBelongsToLivePhoto(playerLayer) ||
         playerLayer.hidden ||
         playerLayer.opacity < 0.02 ||
         !playerLayer.superlayer) {
@@ -227,14 +264,23 @@ static BOOL MSHLayerIsActuallyVisible(AVPlayerLayer *playerLayer,
         return NO;
     }
 
-    CALayer *cursor = playerLayer.superlayer;
+    CALayer *cursor = playerLayer;
 
     while (cursor) {
         if (cursor.hidden || cursor.opacity < 0.02) {
             return NO;
         }
 
+        if (cursor == window.layer) {
+            break;
+        }
+
         cursor = cursor.superlayer;
+    }
+
+    /* Never convert coordinates between unrelated window layer trees. */
+    if (cursor != window.layer) {
+        return NO;
     }
 
     id delegate = playerLayer.delegate;
@@ -276,7 +322,7 @@ static BOOL MSHLayerIsActuallyVisible(AVPlayerLayer *playerLayer,
     if (visibleWidth < 100.0 ||
         visibleHeight < 100.0 ||
         visibleArea < 30000.0 ||
-        (windowArea > 1.0 && (visibleArea / windowArea) < 0.12)) {
+        (windowArea > 1.0 && (visibleArea / windowArea) < 0.35)) {
         return NO;
     }
 
@@ -314,15 +360,53 @@ static void MSHFindBestVisiblePlayerLayerRecursive(CALayer *layer,
     }
 }
 
-static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
+static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
+    AVPlayerLayer *preferredLayer,
+    UIWindow **selectedWindowOut) {
     AVPlayerLayer *bestLayer = nil;
+    UIWindow *bestWindow = nil;
     CGFloat bestArea = 0.0;
+    UIWindow *preferredWindow = nil;
+    CGFloat preferredArea = 0.0;
 
     for (UIWindow *window in MSHForegroundWindows()) {
+        CGFloat areaBefore = bestArea;
+
         MSHFindBestVisiblePlayerLayerRecursive(window.layer,
                                                window,
                                                &bestLayer,
                                                &bestArea);
+
+        if (bestArea > areaBefore) {
+            bestWindow = window;
+        }
+
+        if (preferredLayer && preferredArea <= 0.0) {
+            CGFloat area = 0.0;
+
+            if (MSHLayerIsActuallyVisible(preferredLayer, window, &area)) {
+                preferredArea = area;
+                preferredWindow = window;
+            }
+        }
+    }
+
+    /*
+     * Photos may keep two page players partially visible during transitions.
+     * Preserve the current player while it is effectively tied for largest;
+     * otherwise tiny layout changes make the slider jump between timelines.
+     */
+    if (preferredLayer && preferredWindow &&
+        preferredArea >= (bestArea * 0.85)) {
+        if (selectedWindowOut) {
+            *selectedWindowOut = preferredWindow;
+        }
+
+        return preferredLayer;
+    }
+
+    if (selectedWindowOut) {
+        *selectedWindowOut = bestWindow;
     }
 
     return bestLayer;
@@ -333,8 +417,8 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 @property (nonatomic, strong) AVPlayer *player;
 @property (nonatomic, strong) AVPlayerItem *lastPlayerItem;
 @property (nonatomic, weak) AVPlayerLayer *visiblePlayerLayer;
-@property (nonatomic, strong) id periodicTimeObserver;
 @property (nonatomic, strong) NSTimer *refreshTimer;
+@property (nonatomic, strong) CADisplayLink *displayLink;
 
 @property (nonatomic, weak) UIWindow *hostWindow;
 @property (nonatomic, strong) UIView *barContainer;
@@ -342,8 +426,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 @property (nonatomic, strong) UILabel *currentLabel;
 @property (nonatomic, strong) UILabel *durationLabel;
 @property (nonatomic, strong) NSLayoutConstraint *bottomConstraint;
+@property (nonatomic, copy) NSArray<NSLayoutConstraint *> *hostConstraints;
 @property (nonatomic, assign) BOOL userTracking;
 @property (nonatomic, assign) BOOL videoWasVisible;
+@property (nonatomic, assign) BOOL refreshScheduled;
+@property (nonatomic, assign) double lastRenderedTime;
 
 @end
 
@@ -380,6 +467,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
                                                    object:nil];
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            [self startDisplayLink];
             [self startRefreshTimer];
             [self refreshNow];
         });
@@ -391,22 +479,67 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self stopRefreshTimer];
+    [self.displayLink invalidate];
+    self.displayLink = nil;
     [self bindPlayer:nil];
 }
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
-    [self startRefreshTimer];
-    [self refreshNow];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self startDisplayLink];
+        [self startRefreshTimer];
+        [self refreshNow];
+    });
 }
 
 - (void)applicationWillResignActive:(NSNotification *)notification {
-    [self stopRefreshTimer];
-    [self setBarVisible:NO];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self stopRefreshTimer];
+        self.displayLink.paused = YES;
+        [self bindPlayer:nil];
+        [self setBarVisible:NO];
+    });
 }
 
 - (void)playerItemEnded:(NSNotification *)notification {
-    if (notification.object == self.player.currentItem) {
-        [self updateProgress];
+    __weak typeof(self) weakSelf = self;
+    id endedItem = notification.object;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+
+        if (strongSelf && endedItem == strongSelf.player.currentItem) {
+            [strongSelf updateProgress];
+            strongSelf.displayLink.paused = YES;
+        }
+    });
+}
+
+- (void)startDisplayLink {
+    if (self.displayLink) {
+        return;
+    }
+
+    CADisplayLink *displayLink =
+        [CADisplayLink displayLinkWithTarget:self
+                                    selector:@selector(displayLinkFired:)];
+    displayLink.preferredFramesPerSecond = 60;
+    displayLink.paused = YES;
+    [displayLink addToRunLoop:NSRunLoop.mainRunLoop
+                      forMode:NSRunLoopCommonModes];
+    self.displayLink = displayLink;
+}
+
+- (void)displayLinkFired:(CADisplayLink *)displayLink {
+    if (!self.player || self.barContainer.hidden) {
+        displayLink.paused = YES;
+        return;
+    }
+
+    [self updateProgress];
+
+    if (self.player.rate == 0.0f && !self.userTracking) {
+        displayLink.paused = YES;
     }
 }
 
@@ -420,12 +553,13 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
      * It fixes the old behaviour where the tweak sometimes waited until
      * the stock Photos scrubber was touched before discovering AVPlayer.
      */
-    self.refreshTimer =
-        [NSTimer scheduledTimerWithTimeInterval:0.20
-                                        target:self
-                                      selector:@selector(refreshTimerFired:)
-                                      userInfo:nil
-                                       repeats:YES];
+    NSTimer *timer = [NSTimer timerWithTimeInterval:0.40
+                                             target:self
+                                           selector:@selector(refreshTimerFired:)
+                                           userInfo:nil
+                                            repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    self.refreshTimer = timer;
 }
 
 - (void)stopRefreshTimer {
@@ -437,31 +571,29 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     [self refreshNow];
 }
 
-- (void)notePlayer:(AVPlayer *)player {
-    if (!player) {
-        return;
-    }
-
+- (void)requestRefresh {
     if (![NSThread isMainThread]) {
-        __weak AVPlayer *weakPlayer = player;
-
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self notePlayer:weakPlayer];
+            [self requestRefresh];
         });
 
         return;
     }
 
     /*
-     * Hook-based discovery is retained as a fast path.
-     * refreshNow also performs an independent visible-layer scan, so the
-     * tweak no longer relies on these methods being called after injection.
+     * Hooks are only a wake-up hint. Never bind or walk UIKit synchronously
+     * from an AVFoundation call stack; doing so caused re-entrant layer-tree
+     * access and could also select a Live Photo's private AVPlayer.
      */
-    if (player != self.player && MSHPlayerItemHasUsableDuration(player)) {
-        [self bindPlayer:player];
+    if (self.refreshScheduled) {
+        return;
     }
 
-    [self refreshNow];
+    self.refreshScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.refreshScheduled = NO;
+        [self refreshNow];
+    });
 }
 
 - (void)bindPlayer:(AVPlayer *)player {
@@ -469,37 +601,16 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
         return;
     }
 
-    if (self.periodicTimeObserver && self.player) {
-        @try {
-            [self.player removeTimeObserver:self.periodicTimeObserver];
-        } @catch (__unused NSException *exception) {
-        }
-    }
-
-    self.periodicTimeObserver = nil;
     self.player = player;
     self.lastPlayerItem = nil;
     self.userTracking = NO;
+    self.lastRenderedTime = NAN;
 
     if (!player) {
+        self.displayLink.paused = YES;
         [self setBarVisible:NO];
         return;
     }
-
-    __weak typeof(self) weakSelf = self;
-
-    self.periodicTimeObserver =
-        [player addPeriodicTimeObserverForInterval:CMTimeMake(1, 10)
-                                             queue:dispatch_get_main_queue()
-                                        usingBlock:^(__unused CMTime time) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-
-        if (!strongSelf) {
-            return;
-        }
-
-        [strongSelf updateProgress];
-    }];
 }
 
 - (void)ensureBarInWindow:(UIWindow *)window {
@@ -597,6 +708,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     }
 
     if (self.barContainer.superview != window) {
+        if (self.hostConstraints.count > 0) {
+            [NSLayoutConstraint deactivateConstraints:self.hostConstraints];
+            self.hostConstraints = nil;
+        }
+
         [self.barContainer removeFromSuperview];
         [window addSubview:self.barContainer];
 
@@ -609,16 +725,18 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
             [self.barContainer.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor
                                                            constant:-118.0];
 
-        [NSLayoutConstraint activateConstraints:@[
+        NSArray<NSLayoutConstraint *> *constraints = @[
             [self.barContainer.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor
                                                             constant:14.0],
             [self.barContainer.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor
                                                              constant:-14.0],
             [self.barContainer.heightAnchor constraintEqualToConstant:44.0],
             bottom
-        ]];
+        ];
+        [NSLayoutConstraint activateConstraints:constraints];
 
         self.bottomConstraint = bottom;
+        self.hostConstraints = constraints;
         self.hostWindow = window;
     }
 
@@ -658,6 +776,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     }
 
     self.barContainer.hidden = !visible;
+    self.displayLink.paused = !visible || !self.player;
 
     if (visible && self.hostWindow) {
         [self.hostWindow bringSubviewToFront:self.barContainer];
@@ -665,10 +784,18 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 }
 
 - (void)refreshNow {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self refreshNow];
+        });
+        return;
+    }
+
     if (UIApplication.sharedApplication.applicationState !=
         UIApplicationStateActive) {
         self.videoWasVisible = NO;
         self.visiblePlayerLayer = nil;
+        [self bindPlayer:nil];
         [self setBarVisible:NO];
         return;
     }
@@ -677,13 +804,17 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
      * Actively find the largest real AVPlayerLayer currently visible.
      * This does not depend on the stock Photos timeline being touched first.
      */
-    AVPlayerLayer *visibleLayer = MSHFindBestVisiblePlayerLayer();
+    UIWindow *playerWindow = nil;
+    AVPlayerLayer *visibleLayer =
+        MSHFindBestVisiblePlayerLayer(self.visiblePlayerLayer, &playerWindow);
 
     if (!visibleLayer ||
+        !playerWindow ||
         !visibleLayer.player ||
         !MSHPlayerItemHasUsableDuration(visibleLayer.player)) {
         self.videoWasVisible = NO;
         self.visiblePlayerLayer = nil;
+        [self bindPlayer:nil];
         [self setBarVisible:NO];
         return;
     }
@@ -701,20 +832,14 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     if (currentItem != self.lastPlayerItem) {
         self.lastPlayerItem = currentItem;
         self.userTracking = NO;
+        self.lastRenderedTime = NAN;
     }
 
     if (!self.videoWasVisible) {
         self.videoWasVisible = YES;
     }
 
-    UIWindow *window = MSHBestWindow();
-
-    if (!window) {
-        [self setBarVisible:NO];
-        return;
-    }
-
-    [self ensureBarInWindow:window];
+    [self ensureBarInWindow:playerWindow];
     [self updateProgress];
 
     /*
@@ -723,10 +848,17 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
      * hides its native controls/scrubber, our bar hides too; when Photos'
      * controls return, our bar returns with them.
      */
-    [self setBarVisible:MSHPhotosChromeIsVisible()];
+    [self setBarVisible:MSHPhotosChromeIsVisibleInWindow(playerWindow)];
 }
 
 - (void)updateProgress {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateProgress];
+        });
+        return;
+    }
+
     AVPlayer *player = self.player;
     AVPlayerItem *item = player.currentItem;
 
@@ -749,15 +881,37 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
 
     current = MIN(MAX(current, 0.0), duration);
 
-    self.slider.minimumValue = 0.0f;
-    self.slider.maximumValue = (float)duration;
-
-    if (!self.userTracking) {
-        [self.slider setValue:(float)current animated:NO];
-        self.currentLabel.text = [self timeString:current];
+    if (fabs(self.slider.minimumValue) > 0.001f) {
+        self.slider.minimumValue = 0.0f;
     }
 
-    self.durationLabel.text = [self timeString:duration];
+    if (fabs((double)self.slider.maximumValue - duration) > 0.01) {
+        self.slider.maximumValue = (float)duration;
+    }
+
+    if (!self.userTracking) {
+        /* Ignore tiny backwards clock corrections while playing forward. */
+        if (player.rate > 0.0f && isfinite(self.lastRenderedTime) &&
+            current < self.lastRenderedTime &&
+            (self.lastRenderedTime - current) < 0.25) {
+            current = self.lastRenderedTime;
+        }
+
+        [self.slider setValue:(float)current animated:NO];
+        NSString *currentText = [self timeString:current];
+
+        if (![self.currentLabel.text isEqualToString:currentText]) {
+            self.currentLabel.text = currentText;
+        }
+
+        self.lastRenderedTime = current;
+    }
+
+    NSString *durationText = [self timeString:duration];
+
+    if (![self.durationLabel.text isEqualToString:durationText]) {
+        self.durationLabel.text = durationText;
+    }
 }
 
 - (void)seekToSliderValue {
@@ -792,6 +946,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
             }
 
             strongSelf.userTracking = NO;
+            strongSelf.lastRenderedTime = NAN;
             [strongSelf updateProgress];
         });
     }];
@@ -844,49 +999,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(void) {
     %orig(player);
 
     if (player) {
-        [[MSHProgressManager sharedManager] notePlayer:player];
-    }
-}
-
-%end
-
-%hook AVPlayerViewController
-
-- (void)setPlayer:(AVPlayer *)player {
-    %orig(player);
-
-    if (player) {
-        [[MSHProgressManager sharedManager] notePlayer:player];
-    }
-}
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-
-    if (self.player) {
-        [[MSHProgressManager sharedManager] notePlayer:self.player];
-    }
-}
-
-%end
-
-%hook AVPlayer
-
-- (void)play {
-    %orig;
-    [[MSHProgressManager sharedManager] notePlayer:self];
-}
-
-- (void)pause {
-    %orig;
-    [[MSHProgressManager sharedManager] notePlayer:self];
-}
-
-- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
-    %orig(item);
-
-    if (item) {
-        [[MSHProgressManager sharedManager] notePlayer:self];
+        [[MSHProgressManager sharedManager] requestRefresh];
     }
 }
 
