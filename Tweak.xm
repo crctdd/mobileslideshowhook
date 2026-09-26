@@ -412,7 +412,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     return bestLayer;
 }
 
-@interface MSHProgressManager : NSObject
+@interface MSHProgressManager : NSObject <UIGestureRecognizerDelegate>
 
 @property (nonatomic, strong) AVPlayer *player;
 @property (nonatomic, strong) AVPlayerItem *lastPlayerItem;
@@ -427,10 +427,19 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 @property (nonatomic, strong) UILabel *durationLabel;
 @property (nonatomic, strong) NSLayoutConstraint *bottomConstraint;
 @property (nonatomic, copy) NSArray<NSLayoutConstraint *> *hostConstraints;
+@property (nonatomic, strong) UIPanGestureRecognizer *dismissPanGesture;
 @property (nonatomic, assign) BOOL userTracking;
 @property (nonatomic, assign) BOOL videoWasVisible;
 @property (nonatomic, assign) BOOL refreshScheduled;
+@property (nonatomic, assign) BOOL dismissGestureActive;
+@property (nonatomic, assign) NSUInteger dismissGestureSession;
 @property (nonatomic, assign) double lastRenderedTime;
+@property (nonatomic, assign) BOOL scrubSeekInFlight;
+@property (nonatomic, assign) BOOL scrubSeekPending;
+@property (nonatomic, assign) BOOL scrubEnding;
+@property (nonatomic, assign) BOOL resumeAfterScrub;
+@property (nonatomic, assign) double pendingScrubTime;
+@property (nonatomic, assign) NSUInteger scrubSession;
 
 @end
 
@@ -496,6 +505,10 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     dispatch_async(dispatch_get_main_queue(), ^{
         [self stopRefreshTimer];
         self.displayLink.paused = YES;
+        self.dismissGestureSession++;
+        self.dismissGestureActive = NO;
+        self.barContainer.transform = CGAffineTransformIdentity;
+        self.barContainer.alpha = 1.0;
         [self bindPlayer:nil];
         [self setBarVisible:NO];
     });
@@ -605,6 +618,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     self.lastPlayerItem = nil;
     self.userTracking = NO;
     self.lastRenderedTime = NAN;
+    self.scrubSession++;
+    self.scrubSeekInFlight = NO;
+    self.scrubSeekPending = NO;
+    self.scrubEnding = NO;
+    self.resumeAfterScrub = NO;
 
     if (!player) {
         self.displayLink.paused = YES;
@@ -708,6 +726,15 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     }
 
     if (self.barContainer.superview != window) {
+        if (self.dismissPanGesture && self.hostWindow) {
+            [self.hostWindow removeGestureRecognizer:self.dismissPanGesture];
+            self.dismissPanGesture = nil;
+            self.dismissGestureSession++;
+            self.dismissGestureActive = NO;
+            self.barContainer.transform = CGAffineTransformIdentity;
+            self.barContainer.alpha = 1.0;
+        }
+
         if (self.hostConstraints.count > 0) {
             [NSLayoutConstraint deactivateConstraints:self.hostConstraints];
             self.hostConstraints = nil;
@@ -719,7 +746,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         /*
          * Keep the custom bar above Photos' stock scrubber.
          * Portrait: 118 pt above safe-area bottom
-         * Landscape: 72 pt above safe-area bottom
+         * Landscape: 56 pt above safe-area bottom
          */
         NSLayoutConstraint *bottom =
             [self.barContainer.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor
@@ -740,10 +767,22 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.hostWindow = window;
     }
 
+    if (!self.dismissPanGesture) {
+        UIPanGestureRecognizer *dismissPan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(dismissPanChanged:)];
+        dismissPan.delegate = self;
+        dismissPan.cancelsTouchesInView = NO;
+        dismissPan.delaysTouchesBegan = NO;
+        dismissPan.delaysTouchesEnded = NO;
+        [window addGestureRecognizer:dismissPan];
+        self.dismissPanGesture = dismissPan;
+    }
+
     BOOL landscape =
         CGRectGetWidth(window.bounds) > CGRectGetHeight(window.bounds);
 
-    self.bottomConstraint.constant = landscape ? -72.0 : -118.0;
+    self.bottomConstraint.constant = landscape ? -56.0 : -118.0;
 
     [window bringSubviewToFront:self.barContainer];
 }
@@ -776,7 +815,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     }
 
     self.barContainer.hidden = !visible;
-    self.displayLink.paused = !visible || !self.player;
+    self.displayLink.paused = !visible || !self.player || self.userTracking;
 
     if (visible && self.hostWindow) {
         [self.hostWindow bringSubviewToFront:self.barContainer];
@@ -848,7 +887,136 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
      * hides its native controls/scrubber, our bar hides too; when Photos'
      * controls return, our bar returns with them.
      */
-    [self setBarVisible:MSHPhotosChromeIsVisibleInWindow(playerWindow)];
+    BOOL landscape =
+        CGRectGetWidth(playerWindow.bounds) > CGRectGetHeight(playerWindow.bounds);
+
+    /*
+     * Photos uses a different control hierarchy in landscape on some iOS
+     * releases, so the chrome-name heuristic can return false even while a
+     * video is active. Keep the custom bar available in landscape.
+     */
+    BOOL shouldShowBar =
+        landscape || MSHPhotosChromeIsVisibleInWindow(playerWindow);
+
+    if (!self.dismissGestureActive) {
+        [self setBarVisible:shouldShowBar];
+    }
+}
+
+- (void)dismissPanChanged:(UIPanGestureRecognizer *)gesture {
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan:
+            self.dismissGestureSession++;
+            self.dismissGestureActive = YES;
+            self.barContainer.transform = CGAffineTransformIdentity;
+            self.barContainer.alpha = 1.0;
+            break;
+
+        case UIGestureRecognizerStateChanged: {
+            if (self.dismissGestureActive) {
+                CGFloat translationY =
+                    MAX(0.0, [gesture translationInView:self.hostWindow].y);
+                CGFloat travel =
+                    MAX(120.0, CGRectGetHeight(self.hostWindow.bounds) * 0.35);
+                CGFloat progress = MIN(translationY / travel, 1.0);
+                CGFloat scale = 1.0 - (0.08 * progress);
+                CGAffineTransform transform =
+                    CGAffineTransformMakeTranslation(0.0, translationY);
+
+                self.barContainer.transform =
+                    CGAffineTransformScale(transform, scale, scale);
+                self.barContainer.alpha = 1.0 - (0.65 * progress);
+            }
+            break;
+        }
+
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            NSUInteger session = self.dismissGestureSession;
+
+            [UIView animateWithDuration:0.20
+                             animations:^{
+                self.barContainer.transform = CGAffineTransformIdentity;
+                self.barContainer.alpha = 1.0;
+            } completion:^(__unused BOOL finished) {
+                if (session != self.dismissGestureSession) {
+                    return;
+                }
+
+                self.dismissGestureActive = NO;
+                [self requestRefresh];
+            }];
+            break;
+        }
+
+        case UIGestureRecognizerStateEnded: {
+            NSUInteger session = self.dismissGestureSession;
+
+            [self setBarVisible:NO];
+            self.barContainer.transform = CGAffineTransformIdentity;
+            self.barContainer.alpha = 1.0;
+
+            /*
+             * Keep the bar hidden through Photos' short completion animation.
+             * If the dismissal was cancelled, the refresh restores it once
+             * the video has settled back into place.
+             */
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(0.30 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (session != self.dismissGestureSession) {
+                    return;
+                }
+
+                self.dismissGestureActive = NO;
+                [self refreshNow];
+            });
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer != self.dismissPanGesture ||
+        !self.videoWasVisible ||
+        self.barContainer.hidden) {
+        return NO;
+    }
+
+    UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)gestureRecognizer;
+    CGPoint velocity = [pan velocityInView:self.hostWindow];
+
+    return velocity.y > 0.0 &&
+           velocity.y > (fabs(velocity.x) * 0.75);
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+       shouldReceiveTouch:(UITouch *)touch {
+    if (gestureRecognizer != self.dismissPanGesture) {
+        return YES;
+    }
+
+    UIView *touchedView = touch.view;
+
+    if (!touchedView) {
+        return YES;
+    }
+
+    if (self.barContainer &&
+        [touchedView isDescendantOfView:self.barContainer]) {
+        return NO;
+    }
+
+    return ![touchedView isKindOfClass:[UIControl class]];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    return gestureRecognizer == self.dismissPanGesture ||
+           otherGestureRecognizer == self.dismissPanGesture;
 }
 
 - (void)updateProgress {
@@ -914,7 +1082,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     }
 }
 
-- (void)seekToSliderValue {
+- (void)beginScrubbing {
     AVPlayer *player = self.player;
 
     if (!player) {
@@ -922,15 +1090,68 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         return;
     }
 
-    double seconds = self.slider.value;
+    self.scrubSession++;
+    self.userTracking = YES;
+    self.scrubSeekInFlight = NO;
+    self.scrubSeekPending = NO;
+    self.scrubEnding = NO;
+    self.resumeAfterScrub = player.rate > 0.0f;
+    self.displayLink.paused = YES;
 
-    if (!isfinite(seconds) || seconds < 0.0) {
+    if (self.resumeAfterScrub) {
+        [player pause];
+    }
+}
+
+- (void)queueScrubSeekToSeconds:(double)seconds ending:(BOOL)ending {
+    AVPlayer *player = self.player;
+    AVPlayerItem *item = player.currentItem;
+
+    if (!player || !item || !self.userTracking) {
+        return;
+    }
+
+    double duration = CMTimeGetSeconds(item.duration);
+
+    if (!isfinite(seconds) || !isfinite(duration) || duration <= 0.0) {
+        return;
+    }
+
+    self.pendingScrubTime = MIN(MAX(seconds, 0.0), duration);
+    self.scrubSeekPending = YES;
+
+    if (ending) {
+        self.scrubEnding = YES;
+    }
+
+    [self performPendingScrubSeek];
+}
+
+- (void)performPendingScrubSeek {
+    if (self.scrubSeekInFlight ||
+        !self.scrubSeekPending ||
+        !self.userTracking) {
+        return;
+    }
+
+    AVPlayer *player = self.player;
+
+    if (!player) {
         self.userTracking = NO;
         return;
     }
 
+    double seconds = self.pendingScrubTime;
+    BOOL exactSeek = self.scrubEnding;
+    NSUInteger session = self.scrubSession;
+
+    self.scrubSeekPending = NO;
+    self.scrubSeekInFlight = YES;
+
     CMTime target = CMTimeMakeWithSeconds(seconds, 600);
-    CMTime tolerance = CMTimeMakeWithSeconds(0.03, 600);
+    CMTime tolerance = exactSeek
+        ? kCMTimeZero
+        : CMTimeMakeWithSeconds(1.0 / 30.0, 600);
 
     __weak typeof(self) weakSelf = self;
 
@@ -945,24 +1166,51 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
                 return;
             }
 
-            strongSelf.userTracking = NO;
-            strongSelf.lastRenderedTime = NAN;
-            [strongSelf updateProgress];
+            if (session != strongSelf.scrubSession ||
+                player != strongSelf.player) {
+                return;
+            }
+
+            strongSelf.scrubSeekInFlight = NO;
+
+            if (strongSelf.scrubSeekPending) {
+                [strongSelf performPendingScrubSeek];
+                return;
+            }
+
+            if (strongSelf.scrubEnding) {
+                BOOL shouldResume = strongSelf.resumeAfterScrub;
+
+                strongSelf.scrubEnding = NO;
+                strongSelf.resumeAfterScrub = NO;
+                strongSelf.userTracking = NO;
+                strongSelf.lastRenderedTime = NAN;
+                [strongSelf updateProgress];
+
+                if (shouldResume) {
+                    [player play];
+                    strongSelf.displayLink.paused = NO;
+                }
+            }
         });
     }];
 }
 
 - (void)sliderTouchDown:(UISlider *)slider {
-    self.userTracking = YES;
+    [self beginScrubbing];
 }
 
 - (void)sliderValueChanged:(UISlider *)slider {
-    self.userTracking = YES;
+    if (!self.userTracking) {
+        [self beginScrubbing];
+    }
+
     self.currentLabel.text = [self timeString:slider.value];
+    [self queueScrubSeekToSeconds:slider.value ending:NO];
 }
 
 - (void)sliderTouchEnded:(UISlider *)slider {
-    [self seekToSliderValue];
+    [self queueScrubSeekToSeconds:slider.value ending:YES];
 }
 
 - (void)sliderTapped:(UITapGestureRecognizer *)gesture {
@@ -983,11 +1231,14 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.slider.minimumValue +
         (self.slider.maximumValue - self.slider.minimumValue) * ratio;
 
-    self.userTracking = YES;
+    if (!self.userTracking) {
+        [self beginScrubbing];
+    }
+
     self.slider.value = value;
     self.currentLabel.text = [self timeString:value];
 
-    [self seekToSliderValue];
+    [self queueScrubSeekToSeconds:value ending:YES];
 }
 
 
