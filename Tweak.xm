@@ -297,6 +297,65 @@ static MSHPlaybackChromeState MSHPlaybackChromeStateInWindow(
     return state;
 }
 
+static BOOL MSHObjectLooksLikePhotosDetails(id object) {
+    if (!object) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass([object class]);
+    static NSArray<NSString *> *tokens;
+    static dispatch_once_t onceToken;
+
+    dispatch_once(&onceToken, ^{
+        tokens = @[
+            @"PhotosDetails",
+            @"PhotoDetails",
+            @"AssetDetails",
+            @"AssetInfo",
+            @"PhotoInfo",
+            @"VisualLookup"
+        ];
+    });
+
+    for (NSString *token in tokens) {
+        if ([className rangeOfString:token
+                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL MSHPhotosDetailsVisibleInView(UIView *view) {
+    if (!view || view.hidden || view.alpha < 0.02) {
+        return NO;
+    }
+
+    CGRect bounds = view.bounds;
+    BOOL largeEnough =
+        CGRectGetWidth(bounds) > 200.0 && CGRectGetHeight(bounds) > 180.0;
+
+    if (largeEnough &&
+        (MSHObjectLooksLikePhotosDetails(view) ||
+         MSHObjectLooksLikePhotosDetails(view.nextResponder)) &&
+        MSHViewAndAncestorsAreVisible(view)) {
+        return YES;
+    }
+
+    for (UIView *subview in view.subviews) {
+        if (MSHPhotosDetailsVisibleInView(subview)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL MSHPhotosDetailsIsVisibleInWindow(UIWindow *window) {
+    return window && MSHPhotosDetailsVisibleInView(window);
+}
+
 static BOOL MSHViewIsActuallyVisible(UIView *view) {
     if (!view || !view.window || view.hidden || view.alpha < 0.02) {
         return NO;
@@ -391,6 +450,18 @@ static BOOL MSHLayerIsActuallyVisible(AVPlayerLayer *playerLayer,
 
     CGRect intersection =
         CGRectIntersection(rectInWindowLayer, window.layer.bounds);
+
+    CGPoint windowCenter = CGPointMake(CGRectGetMidX(window.layer.bounds),
+                                       CGRectGetMidY(window.layer.bounds));
+
+    /*
+     * The Photos details screen moves the video into the upper pane in
+     * portrait and the left pane in landscape. In normal playback, including
+     * letterboxed video, the active player layer still covers screen center.
+     */
+    if (!CGRectContainsPoint(intersection, windowCenter)) {
+        return NO;
+    }
 
     CGFloat visibleWidth = CGRectGetWidth(intersection);
     CGFloat visibleHeight = CGRectGetHeight(intersection);
@@ -990,6 +1061,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.videoWasVisible = YES;
     }
 
+    if (MSHPhotosDetailsIsVisibleInWindow(playerWindow)) {
+        [self setBarVisible:NO];
+        return;
+    }
+
     [self ensureBarInWindow:playerWindow];
     [self updateProgress];
 
@@ -1077,6 +1153,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
             self.dismissGestureActive = YES;
             self.barContainer.transform = CGAffineTransformIdentity;
             self.barContainer.alpha = 1.0;
+
+            if ([gesture velocityInView:self.hostWindow].y < 0.0) {
+                /* Upward reveals Photos details; hide before it can overlap. */
+                [self setBarVisible:NO];
+            }
             break;
 
         case UIGestureRecognizerStateChanged: {
@@ -1168,8 +1249,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)gestureRecognizer;
     CGPoint velocity = [pan velocityInView:self.hostWindow];
 
-    return velocity.y > 0.0 &&
-           velocity.y > (fabs(velocity.x) * 0.75);
+    return fabs(velocity.y) > (fabs(velocity.x) * 0.75);
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
