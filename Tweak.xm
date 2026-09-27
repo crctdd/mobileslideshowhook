@@ -356,6 +356,72 @@ static BOOL MSHPhotosDetailsIsVisibleInWindow(UIWindow *window) {
     return window && MSHPhotosDetailsVisibleInView(window);
 }
 
+static BOOL MSHObjectLooksLikePhotosEditor(id object) {
+    if (!object) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass([object class]);
+    static NSArray<NSString *> *tokens;
+    static dispatch_once_t onceToken;
+
+    dispatch_once(&onceToken, ^{
+        tokens = @[
+            @"PhotoEdit",
+            @"PhotosEdit",
+            @"VideoEdit",
+            @"PhotoEditing",
+            @"VideoEditing",
+            @"EditViewController",
+            @"EditingViewController",
+            @"EditToolController",
+            @"TrimViewController",
+            @"TrimController",
+            @"TrimTool",
+            @"CinematicEdit",
+            @"CropViewController"
+        ];
+    });
+
+    for (NSString *token in tokens) {
+        if ([className rangeOfString:token
+                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL MSHPhotosEditorVisibleInView(UIView *view) {
+    if (!view || view.hidden || view.alpha < 0.02) {
+        return NO;
+    }
+
+    CGRect bounds = view.bounds;
+    BOOL largeEnough =
+        CGRectGetWidth(bounds) > 200.0 && CGRectGetHeight(bounds) > 180.0;
+
+    if (largeEnough &&
+        (MSHObjectLooksLikePhotosEditor(view) ||
+         MSHObjectLooksLikePhotosEditor(view.nextResponder)) &&
+        MSHViewAndAncestorsAreVisible(view)) {
+        return YES;
+    }
+
+    for (UIView *subview in view.subviews) {
+        if (MSHPhotosEditorVisibleInView(subview)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL MSHPhotosEditorIsVisibleInWindow(UIWindow *window) {
+    return window && MSHPhotosEditorVisibleInView(window);
+}
+
 static BOOL MSHViewIsActuallyVisible(UIView *view) {
     if (!view || !view.window || view.hidden || view.alpha < 0.02) {
         return NO;
@@ -1061,7 +1127,11 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.videoWasVisible = YES;
     }
 
-    if (MSHPhotosDetailsIsVisibleInWindow(playerWindow)) {
+    if (MSHPhotosDetailsIsVisibleInWindow(playerWindow) ||
+        MSHPhotosEditorIsVisibleInWindow(playerWindow)) {
+        self.videoWasVisible = NO;
+        self.visiblePlayerLayer = nil;
+        [self bindPlayer:nil];
         [self setBarVisible:NO];
         return;
     }
