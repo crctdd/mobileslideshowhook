@@ -146,22 +146,13 @@ static BOOL MSHViewAndAncestorsAreVisible(UIView *view) {
            CGRectGetHeight(intersection) > 20.0;
 }
 
-static BOOL MSHClassNameLooksLikePhotosChrome(UIView *view) {
-    NSString *className = NSStringFromClass(view.class);
-
-    if (className.length == 0) {
+static BOOL MSHClassNameContainsAnyToken(id object,
+                                         NSArray<NSString *> *tokens) {
+    if (!object || tokens.count == 0) {
         return NO;
     }
 
-    NSArray<NSString *> *tokens = @[
-        @"NavigationBar",
-        @"Toolbar",
-        @"Chrome",
-        @"Scrubber",
-        @"Accessory",
-        @"PlaybackControl",
-        @"ControlBar"
-    ];
+    NSString *className = NSStringFromClass([object class]);
 
     for (NSString *token in tokens) {
         if ([className rangeOfString:token
@@ -171,6 +162,25 @@ static BOOL MSHClassNameLooksLikePhotosChrome(UIView *view) {
     }
 
     return NO;
+}
+
+static BOOL MSHClassNameLooksLikePhotosChrome(UIView *view) {
+    static NSArray<NSString *> *tokens;
+    static dispatch_once_t onceToken;
+
+    dispatch_once(&onceToken, ^{
+        tokens = @[
+            @"NavigationBar",
+            @"Toolbar",
+            @"Chrome",
+            @"Scrubber",
+            @"Accessory",
+            @"PlaybackControl",
+            @"ControlBar"
+        ];
+    });
+
+    return MSHClassNameContainsAnyToken(view, tokens);
 }
 
 static BOOL MSHPhotosChromeVisibleInView(UIView *view) {
@@ -219,12 +229,6 @@ typedef struct {
 } MSHPlaybackChromeState;
 
 static BOOL MSHClassNameLooksLikePlaybackChrome(UIView *view) {
-    NSString *className = NSStringFromClass(view.class);
-
-    if (className.length == 0) {
-        return NO;
-    }
-
     static NSArray<NSString *> *tokens;
     static dispatch_once_t onceToken;
 
@@ -241,14 +245,7 @@ static BOOL MSHClassNameLooksLikePlaybackChrome(UIView *view) {
         ];
     });
 
-    for (NSString *token in tokens) {
-        if ([className rangeOfString:token
-                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
-        }
-    }
-
-    return NO;
+    return MSHClassNameContainsAnyToken(view, tokens);
 }
 
 static void MSHFindPlaybackChromeState(UIView *view,
@@ -297,54 +294,38 @@ static MSHPlaybackChromeState MSHPlaybackChromeStateInWindow(
     return state;
 }
 
-static BOOL MSHObjectLooksLikePhotosDetails(id object) {
-    if (!object) {
-        return NO;
-    }
-
-    NSString *className = NSStringFromClass([object class]);
-    static NSArray<NSString *> *tokens;
-    static dispatch_once_t onceToken;
-
-    dispatch_once(&onceToken, ^{
-        tokens = @[
-            @"PhotosDetails",
-            @"PhotoDetails",
-            @"AssetDetails",
-            @"AssetInfo",
-            @"PhotoInfo",
-            @"VisualLookup"
-        ];
-    });
-
-    for (NSString *token in tokens) {
-        if ([className rangeOfString:token
-                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
-        }
-    }
-
-    return NO;
-}
-
-static BOOL MSHPhotosDetailsVisibleInView(UIView *view) {
+static BOOL MSHBlockingSurfaceVisibleInView(
+    UIView *view,
+    NSArray<NSString *> *fullScreenTokens,
+    NSArray<NSString *> *floatingOverlayTokens) {
     if (!view || view.hidden || view.alpha < 0.02) {
         return NO;
     }
 
     CGRect bounds = view.bounds;
-    BOOL largeEnough =
+    BOOL fullScreenSize =
         CGRectGetWidth(bounds) > 200.0 && CGRectGetHeight(bounds) > 180.0;
+    BOOL overlaySize =
+        CGRectGetWidth(bounds) > 80.0 && CGRectGetHeight(bounds) > 60.0;
+    UIResponder *responder = view.nextResponder;
+    BOOL matchesFullScreenSurface =
+        fullScreenSize &&
+        (MSHClassNameContainsAnyToken(view, fullScreenTokens) ||
+         MSHClassNameContainsAnyToken(responder, fullScreenTokens));
+    BOOL matchesFloatingOverlay =
+        overlaySize &&
+        (MSHClassNameContainsAnyToken(view, floatingOverlayTokens) ||
+         MSHClassNameContainsAnyToken(responder, floatingOverlayTokens));
 
-    if (largeEnough &&
-        (MSHObjectLooksLikePhotosDetails(view) ||
-         MSHObjectLooksLikePhotosDetails(view.nextResponder)) &&
+    if ((matchesFullScreenSurface || matchesFloatingOverlay) &&
         MSHViewAndAncestorsAreVisible(view)) {
         return YES;
     }
 
     for (UIView *subview in view.subviews) {
-        if (MSHPhotosDetailsVisibleInView(subview)) {
+        if (MSHBlockingSurfaceVisibleInView(subview,
+                                            fullScreenTokens,
+                                            floatingOverlayTokens)) {
             return YES;
         }
     }
@@ -352,21 +333,22 @@ static BOOL MSHPhotosDetailsVisibleInView(UIView *view) {
     return NO;
 }
 
-static BOOL MSHPhotosDetailsIsVisibleInWindow(UIWindow *window) {
-    return window && MSHPhotosDetailsVisibleInView(window);
-}
-
-static BOOL MSHObjectLooksLikePhotosEditor(id object) {
-    if (!object) {
-        return NO;
-    }
-
-    NSString *className = NSStringFromClass([object class]);
-    static NSArray<NSString *> *tokens;
+static BOOL MSHBlockingSurfaceIsVisible(void) {
+    static NSArray<NSString *> *fullScreenTokens;
+    static NSArray<NSString *> *floatingOverlayTokens;
     static dispatch_once_t onceToken;
 
     dispatch_once(&onceToken, ^{
-        tokens = @[
+        fullScreenTokens = @[
+            /* Photos information/details surfaces. */
+            @"PhotosDetails",
+            @"PhotoDetails",
+            @"AssetDetails",
+            @"AssetInfo",
+            @"PhotoInfo",
+            @"VisualLookup",
+
+            /* Photos editing and trimming surfaces. */
             @"PhotoEdit",
             @"PhotosEdit",
             @"VideoEdit",
@@ -379,13 +361,61 @@ static BOOL MSHObjectLooksLikePhotosEditor(id object) {
             @"TrimController",
             @"TrimTool",
             @"CinematicEdit",
-            @"CropViewController"
+            @"CropViewController",
+
+            /* Public and private iOS share-sheet containers. */
+            @"UIActivityViewController",
+            @"ActivityContentViewController",
+            @"ActivityGroupViewController",
+            @"ActivityListViewController",
+            @"ActivityContentView",
+            @"ActivityGroupView",
+            @"ShareSheet",
+            @"SharingViewController",
+
+            /* Other workflows that can leave the original player alive. */
+            @"DocumentPicker",
+            @"PHPickerViewController",
+            @"ImagePickerController",
+            @"AlbumPicker",
+            @"CollectionPicker",
+            @"PeoplePicker",
+            @"AddToAlbum",
+            @"Markup",
+            @"Slideshow",
+            @"QLPreviewController",
+            @"QuickLook",
+            @"MailCompose",
+            @"MessageCompose"
+        ];
+
+        floatingOverlayTokens = @[
+            @"AlertController",
+            @"ActionSheet",
+            @"ContextMenu",
+            @"Popover",
+            @"RoutePicker",
+            @"RoutingViewController",
+            @"AirPlay",
+            @"PrintInteraction",
+            @"CloudSharing",
+            @"ProgressViewController",
+            @"Keyboard",
+            @"InputSetContainer",
+            @"EditMenu",
+            @"CalloutBar",
+            @"PictureInPicture",
+            @"DragPreview",
+            @"DraggingItem",
+            @"DropPreview"
         ];
     });
 
-    for (NSString *token in tokens) {
-        if ([className rangeOfString:token
-                            options:NSCaseInsensitiveSearch].location != NSNotFound) {
+    /* Blocking surfaces may use a separate foreground window. */
+    for (UIWindow *window in MSHForegroundWindows()) {
+        if (MSHBlockingSurfaceVisibleInView(window,
+                                            fullScreenTokens,
+                                            floatingOverlayTokens)) {
             return YES;
         }
     }
@@ -393,24 +423,59 @@ static BOOL MSHObjectLooksLikePhotosEditor(id object) {
     return NO;
 }
 
-static BOOL MSHPhotosEditorVisibleInView(UIView *view) {
-    if (!view || view.hidden || view.alpha < 0.02) {
+static UIView *MSHHostingViewForLayer(CALayer *layer) {
+    CALayer *cursor = layer;
+    NSUInteger depth = 0;
+
+    while (cursor && depth < 128) {
+        if ([cursor.delegate isKindOfClass:[UIView class]]) {
+            return (UIView *)cursor.delegate;
+        }
+
+        cursor = cursor.superlayer;
+        depth++;
+    }
+
+    return nil;
+}
+
+static BOOL MSHViewControllerTreeHasCoveringPresentation(
+    UIViewController *controller,
+    UIView *playerView,
+    NSUInteger depth) {
+    if (!controller || !playerView || depth > 64) {
         return NO;
     }
 
-    CGRect bounds = view.bounds;
-    BOOL largeEnough =
-        CGRectGetWidth(bounds) > 200.0 && CGRectGetHeight(bounds) > 180.0;
+    UIViewController *presented = controller.presentedViewController;
 
-    if (largeEnough &&
-        (MSHObjectLooksLikePhotosEditor(view) ||
-         MSHObjectLooksLikePhotosEditor(view.nextResponder)) &&
-        MSHViewAndAncestorsAreVisible(view)) {
-        return YES;
+    if (presented && !presented.isBeingDismissed) {
+        UIView *presentedView = presented.viewIfLoaded;
+
+        if (presentedView &&
+            MSHViewAndAncestorsAreVisible(presentedView) &&
+            playerView != presentedView &&
+            ![playerView isDescendantOfView:presentedView]) {
+            return YES;
+        }
+
+        if (MSHViewControllerTreeHasCoveringPresentation(presented,
+                                                         playerView,
+                                                         depth + 1)) {
+            return YES;
+        }
     }
 
-    for (UIView *subview in view.subviews) {
-        if (MSHPhotosEditorVisibleInView(subview)) {
+    for (UIViewController *child in controller.childViewControllers) {
+        UIView *childView = child.viewIfLoaded;
+
+        if (!childView || !childView.window) {
+            continue;
+        }
+
+        if (MSHViewControllerTreeHasCoveringPresentation(child,
+                                                         playerView,
+                                                         depth + 1)) {
             return YES;
         }
     }
@@ -418,8 +483,19 @@ static BOOL MSHPhotosEditorVisibleInView(UIView *view) {
     return NO;
 }
 
-static BOOL MSHPhotosEditorIsVisibleInWindow(UIWindow *window) {
-    return window && MSHPhotosEditorVisibleInView(window);
+static BOOL MSHPlayerLayerIsCoveredByPresentedController(
+    AVPlayerLayer *playerLayer,
+    UIWindow *window) {
+    UIView *playerView = MSHHostingViewForLayer(playerLayer);
+    UIViewController *rootController = window.rootViewController;
+
+    if (!playerView || !rootController) {
+        return NO;
+    }
+
+    return MSHViewControllerTreeHasCoveringPresentation(rootController,
+                                                        playerView,
+                                                        0);
 }
 
 static BOOL MSHViewIsActuallyVisible(UIView *view) {
@@ -1070,6 +1146,13 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
     }
 }
 
+- (void)detachPlayerAndHideBar {
+    self.videoWasVisible = NO;
+    self.visiblePlayerLayer = nil;
+    [self bindPlayer:nil];
+    [self setBarVisible:NO];
+}
+
 - (void)refreshNow {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1080,10 +1163,12 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
 
     if (UIApplication.sharedApplication.applicationState !=
         UIApplicationStateActive) {
-        self.videoWasVisible = NO;
-        self.visiblePlayerLayer = nil;
-        [self bindPlayer:nil];
-        [self setBarVisible:NO];
+        [self detachPlayerAndHideBar];
+        return;
+    }
+
+    if (MSHBlockingSurfaceIsVisible()) {
+        [self detachPlayerAndHideBar];
         return;
     }
 
@@ -1099,10 +1184,13 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         !playerWindow ||
         !visibleLayer.player ||
         !MSHPlayerItemHasUsableDuration(visibleLayer.player)) {
-        self.videoWasVisible = NO;
-        self.visiblePlayerLayer = nil;
-        [self bindPlayer:nil];
-        [self setBarVisible:NO];
+        [self detachPlayerAndHideBar];
+        return;
+    }
+
+    if (MSHPlayerLayerIsCoveredByPresentedController(visibleLayer,
+                                                     playerWindow)) {
+        [self detachPlayerAndHideBar];
         return;
     }
 
@@ -1123,18 +1211,7 @@ static AVPlayerLayer *MSHFindBestVisiblePlayerLayer(
         self.landscapeUserHidden = NO;
     }
 
-    if (!self.videoWasVisible) {
-        self.videoWasVisible = YES;
-    }
-
-    if (MSHPhotosDetailsIsVisibleInWindow(playerWindow) ||
-        MSHPhotosEditorIsVisibleInWindow(playerWindow)) {
-        self.videoWasVisible = NO;
-        self.visiblePlayerLayer = nil;
-        [self bindPlayer:nil];
-        [self setBarVisible:NO];
-        return;
-    }
+    self.videoWasVisible = YES;
 
     [self ensureBarInWindow:playerWindow];
     [self updateProgress];
